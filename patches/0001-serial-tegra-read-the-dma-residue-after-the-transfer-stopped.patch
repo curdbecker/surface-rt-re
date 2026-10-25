@@ -1,0 +1,85 @@
+From: Curd Becker <me@curd-becker.de>
+Subject: [PATCH] serial: tegra: read the DMA residue after the transfer stopped
+
+Commit 109a951a9f ("serial: tegra: Read DMA status before terminating")
+changed the stop sequence of both directions to dmaengine_pause(),
+dmaengine_tx_status(), dmaengine_terminate_all(): on the GPC DMA the
+descriptor is gone after terminating, and the pause freezes the count.
+
+The APB DMA used from Tegra20 to Tegra124 has no device_pause operation.
+dmaengine_pause() returns -ENOSYS there and the channel keeps running, so the
+residue is read from a live channel. A burst that lands between that read and
+the terminate is not counted; on receive it is also no longer in the FIFO, so
+the PIO path that follows does not see it either. The bytes of that burst are
+lost silently: no overrun, no buffer overrun, no framing error, and icount.rx
+is only advanced for what was pushed.
+
+Seen on a Tegra30 (Microsoft Surface RT, ttyTHS1 with RTS/CTS) against a
+peer that echoes a 64 KiB sequence: the peer received every byte, while the
+host lost 4-byte units (the APB DMA burst size for the UART) at 2 and 3 Mbaud,
+up to six per run, with all driver error counters at zero.
+
+The APB DMA's terminate already does the right thing: it pauses the channel,
+waits for the burst in flight, adds the transferred count to the descriptor
+and keeps the descriptor on its free list, where dmaengine_tx_status() still
+finds it. So use the old order, terminate then read the status, when the
+engine cannot pause, and keep pause, status, terminate otherwise.
+
+Fixes: 109a951a9f ("serial: tegra: Read DMA status before terminating")
+---
+--- a/drivers/tty/serial/serial-tegra.c
++++ b/drivers/tty/serial/serial-tegra.c
+@@ -614,6 +614,31 @@
+ 	return ret;
+ }
+ 
++/*
++ * Stop a DMA transfer and get its final residue. The status has to describe the
++ * transfer as it stopped: read while the channel still runs, a burst that lands
++ * between the read and the stop is neither counted nor left in the FIFO.
++ *
++ * With a DMA engine that can pause (GPC DMA, Tegra186 on) pause, read the status,
++ * then terminate - terminating first deletes the descriptor there. The APB DMA
++ * (tegra20-apb-dma: Tegra20 to Tegra124) has no pause operation, so there
++ * dmaengine_pause() fails and the channel keeps running. Its terminate pauses
++ * the channel itself, waits for the burst in flight, adds the transferred count
++ * to the descriptor and keeps the descriptor on its free list, so the status
++ * read afterwards is exact.
++ */
++static void tegra_uart_dma_stop(struct dma_chan *chan, dma_cookie_t cookie,
++				struct dma_tx_state *state)
++{
++	if (dmaengine_pause(chan) == 0) {
++		dmaengine_tx_status(chan, cookie, state);
++		dmaengine_terminate_all(chan);
++	} else {
++		dmaengine_terminate_all(chan);
++		dmaengine_tx_status(chan, cookie, state);
++	}
++}
++
+ static void tegra_uart_stop_tx(struct uart_port *u)
+ {
+ 	struct tegra_uart_port *tup = to_tegra_uport(u);
+@@ -623,9 +648,7 @@
+ 	if (tup->tx_in_progress != TEGRA_UART_TX_DMA)
+ 		return;
+ 
+-	dmaengine_pause(tup->tx_dma_chan);
+-	dmaengine_tx_status(tup->tx_dma_chan, tup->tx_cookie, &state);
+-	dmaengine_terminate_all(tup->tx_dma_chan);
++	tegra_uart_dma_stop(tup->tx_dma_chan, tup->tx_cookie, &state);
+ 	count = tup->tx_bytes_requested - state.residue;
+ 	async_tx_ack(tup->tx_dma_desc);
+ 	uart_xmit_advance(&tup->uport, count);
+@@ -767,9 +790,7 @@
+ 		return;
+ 	}
+ 
+-	dmaengine_pause(tup->rx_dma_chan);
+-	dmaengine_tx_status(tup->rx_dma_chan, tup->rx_cookie, &state);
+-	dmaengine_terminate_all(tup->rx_dma_chan);
++	tegra_uart_dma_stop(tup->rx_dma_chan, tup->rx_cookie, &state);
+ 
+ 	tegra_uart_rx_buffer_push(tup, state.residue);
+ 	tup->rx_dma_active = false;

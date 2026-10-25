@@ -1,0 +1,19 @@
+# Large or fetched content kept local, not committed:
+# the Windows RT driver package (~44 MB).
+data/windows-drivers/
+
+# IDA databases (re-derived by running securet30sec_loader.py on the decrypted bootloader)
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.venv-container/
+.claude-home/

@@ -1,0 +1,16 @@
+# TPS65911 (I2C5 0x2d) registers 0x00-0x9f as the UEFI firmware hands them over.
+# Read at the start of tps65910_i2c_probe() (debug change: i2c_smbus_read_byte_data loop after the regmap
+# init, before the driver writes anything). Previous power-off: long press (general + turn-off reset).
+# Kernel: libre-tegra 7.0.1 @ bfffc6d6656e + kernel/0001-0003. Surface RT, 2026-10-24.
+# 0x00-0x02 are the RTC (seconds, minutes, hours).
+     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
+00: 56 50 22 24 10 26 04 00 49 14 21 16 10 26 00 00
+10: 01 02 00 00 00 27 00 00 00 00 00 00 1f 01 01 00
+20: 85 8d 37 00 8d 45 4b 01 27 00 00 00 00 00 00 00
+30: 51 21 65 09 11 11 21 51 0d 00 00 00 00 00 39 96
+40: 76 de c7 21 08 00 08 00 00 00 00 00 00 00 00 02
+50: 00 ff 00 ff 40 ff 00 00 00 00 00 00 00 00 00 00
+60: 07 08 87 08 0a 08 07 07 07 00 20 00 00 00 00 00
+70: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+80: 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+90: 00 09 00 00 00 00 00 00 00 00 00 00 00 00 00 00

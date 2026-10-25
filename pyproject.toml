@@ -1,0 +1,22 @@
+[project]
+name = "surface-rt-re"
+description = "Surface RT (Tegra30) reverse engineering: boot firmware (first stage + emulator), boot chain, platform"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+version = "0.1.0"
+dependencies = [
+    "capstone",     # disassembly in securet30.image
+    "unicorn",      # the CPU model in securet30.soc / sdhci
+]
+
+[dependency-groups]
+# Regenerating the loader's OpenSSL header and table (gen_securet30sec_openssl.py) and extracting UEFI images.
+tools = [
+    "libclang>=18.1.1",
+    "pcpp",
+    "uefi-firmware",
+]
+
+[tool.uv]
+default-groups = []
