@@ -1,0 +1,2 @@
+# The build environment needs no sources; build.sh runs on the mounted checkout.
+*

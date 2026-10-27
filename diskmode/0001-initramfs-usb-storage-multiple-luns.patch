@@ -1,0 +1,93 @@
+initramfs: setup_usb_storage_configfs: expose several block devices as LUNs
+
+pmos.usb-storage= (and setup_usb_storage_configfs) takes a comma-separated list of block devices, one LUN each;
+a ":ro" suffix makes that LUN read-only. A read-write LUN on a device with force_ro set (an eMMC boot partition)
+clears force_ro, since the LUN could not open it otherwise. A single device without a suffix behaves as before.
+The debug-shell teardown removes the extra LUNs before the function.
+
+Applies to postmarketos-initramfs (usr/share/initramfs/init_functions.sh), with patch -p1 from the root.
+
+--- a/usr/share/initramfs/init_functions.sh
++++ b/usr/share/initramfs/init_functions.sh
+@@ -1011,18 +1011,21 @@
+ 	} &
+ }
+ 
++# $1: comma-separated block devices, exposed as one LUN each (lun.0, lun.1, ...);
++#     a ":ro" suffix makes that LUN read-only, otherwise it is read-write
+ setup_usb_storage_configfs() {
+ 	local active_udc
+-	local storage_dev
++	local storage_devs
++	local spec dev ro lun n
+ 	active_udc="$(cat $CONFIGFS/g1/UDC)"
+-	storage_dev="$1"
++	storage_devs="$1"
+ 
+ 	if ! [ -e "$CONFIGFS" ]; then
+ 		echo "  $CONFIGFS does not exist, can't set up storage gadget"
+ 		return 1
+ 	fi
+ 
+-	if [ -z "$storage_dev" ]; then
++	if [ -z "$storage_devs" ]; then
+ 		if [ -e "$CONFIGFS/g1/configs/c.1/$CONFIGFS_MASS_STORAGE_FUNCTION" ]; then
+ 			echo "Disabling USB mass storage gadget"
+ 			unlink "$CONFIGFS/g1/configs/c.1/$CONFIGFS_MASS_STORAGE_FUNCTION"
+@@ -1031,10 +1034,13 @@
+ 		return 0
+ 	fi
+ 
+-	if ! [ -b "$storage_dev" ]; then
+-		echo "  Storage device '$storage_dev' is not a block device"
+-		return 1
+-	fi
++	for spec in $(echo "$storage_devs" | tr ',' ' '); do
++		dev="${spec%:ro}"
++		if ! [ -b "$dev" ]; then
++			echo "  Storage device '$dev' is not a block device"
++			return 1
++		fi
++	done
+ 
+ 	# Set up network gadget if not already done
+ 	if [ -z "$active_udc" ]; then
+@@ -1048,7 +1054,26 @@
+ 	mkdir -p "$CONFIGFS/g1/functions/$CONFIGFS_MASS_STORAGE_FUNCTION" \
+ 		|| echo "  Couldn't create $CONFIGFS/g1/functions/$CONFIGFS_MASS_STORAGE_FUNCTION"
+ 
+-	echo "$storage_dev" > "$CONFIGFS/g1/functions/$CONFIGFS_MASS_STORAGE_FUNCTION/lun.0/file"
++	n=0
++	for spec in $(echo "$storage_devs" | tr ',' ' '); do
++		dev="${spec%:ro}"
++		ro=0
++		[ "$dev" != "$spec" ] && ro=1
++		# A read-write LUN on a force_ro device (e.g. an eMMC boot partition) cannot open it
++		if [ "$ro" = 0 ] && [ -w "/sys/block/${dev##*/}/force_ro" ]; then
++			echo 0 > "/sys/block/${dev##*/}/force_ro" \
++				|| echo "  Couldn't clear force_ro on $dev"
++		fi
++		lun="$CONFIGFS/g1/functions/$CONFIGFS_MASS_STORAGE_FUNCTION/lun.$n"
++		mkdir -p "$lun" || echo "  Couldn't create $lun"
++		# ro before file: writing file opens the backing device with the current ro mode
++		echo "$ro" > "$lun/ro" || echo "  Couldn't set ro=$ro on lun.$n"
++		if ! echo "$dev" > "$lun/file"; then
++			echo "  Couldn't expose $dev as lun.$n"
++			return 1
++		fi
++		n=$((n + 1))
++	done
+ 
+ 	# Link the mass storage function to the configuration
+ 	ln -sf "$CONFIGFS/g1/functions/$CONFIGFS_MASS_STORAGE_FUNCTION" "$CONFIGFS/g1/configs/c.1" \
+@@ -1211,6 +1236,10 @@
+ 	rm -f $CONFIGFS/g1/configs/c.1/"$CONFIGFS_ACM_FUNCTION"
+ 	rmdir $CONFIGFS/g1/functions/"$CONFIGFS_ACM_FUNCTION"
+ 	rm -f "$CONFIGFS/g1/configs/c.1/$CONFIGFS_MASS_STORAGE_FUNCTION"
++	# lun.0 goes with the function; further LUNs must be removed first
++	for lun in "$CONFIGFS/g1/functions/$CONFIGFS_MASS_STORAGE_FUNCTION"/lun.[1-9]*; do
++		[ -d "$lun" ] && rmdir "$lun"
++	done
+ 	rmdir "$CONFIGFS/g1/functions/$CONFIGFS_MASS_STORAGE_FUNCTION"
+ 	setup_usb_configfs_udc
+ 

@@ -17,3 +17,5 @@ __pycache__/
 .venv/
 .venv-container/
 .claude-home/
+# build.sh results
+/out/

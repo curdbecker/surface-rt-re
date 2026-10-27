@@ -1,0 +1,69 @@
+#!/bin/sh
+# Prints the boot trace of the last trace run (../boottrace.h): the cause of the last reset, the checkpoint it
+# reached, the stub's sums of the U-Boot it loaded against the slot on the eMMC (../payloads/uboot_stub.h), and
+# the console log; then clears the trace, so a run that never reaches the trace stub cannot show an old result.
+# Disk mode only: the kernel's mem= keeps Linux below the log.
+H=/usr/share/srt/boottrace.h
+STUB=/usr/share/srt/uboot_stub.h
+
+def() { awk -v n="$1" '$1 == "#define" && $2 == n { print $3 }' "${2:-$H}"; }
+rd() { devmem2 "$(printf 0x%x "$1")" w | awk 'END { print $NF }'; }
+wr() { devmem2 "$(printf 0x%x "$1")" w "$2" > /dev/null; }
+
+PROGRESS=$(def BOOTTRACE_PROGRESS)
+MAGIC=$(def BOOTTRACE_MAGIC)
+LOG=$(def BOOTTRACE_LOG)
+LOG_SIZE=$(def BOOTTRACE_LOG_SIZE)
+LOG_MAGIC=$(def BOOTTRACE_LOG_MAGIC)
+VIA_WDT=$(def BOOTTRACE_VIA_WDT)
+
+r=$(( $(rd "$(def PMC_RST_STATUS "$STUB")") & 7 ))
+case $r in
+	0) cause=power-on ;; 1) cause=watchdog ;; 2) cause=sensor ;; 3) cause=software ;; 4) cause=LP0 ;; *) cause=other ;;
+esac
+echo "last reset: $cause ($r)"
+
+p=$(( $(rd "$PROGRESS") ))
+if [ $(( p & ~0xffff )) -eq $(( MAGIC )) ]; then
+	echo "checkpoint: $(( p & 0xff ))"
+	[ $(( p & VIA_WDT )) -ne 0 ] &&
+		echo "the watchdog reset re-entered the trace stub, which then entered APX (the boot ROM did not on RCM)"
+else
+	printf 'checkpoint: none (progress register %#x)\n' "$p"
+fi
+
+case $(def UBOOT_DEVICE "$STUB") in
+	NVDAUEFI_DEVICE_BOOT0) dev=/dev/mmcblk0boot0 ;;
+	NVDAUEFI_DEVICE_BOOT1) dev=/dev/mmcblk0boot1 ;;
+esac
+off=$(( $(def UBOOT_OFFSET "$STUB") )); size=$(( $(def UBOOT_SIZE "$STUB") ))
+slot=$(dd if="$dev" bs=512 skip=$(( off / 512 )) count=$(( size / 512 )) 2>/dev/null | od -An -v -tu4 |
+	awk '{ for (i = 1; i <= NF; i++) s = (s + $i) % 4294967296 }
+		END { printf "0x%04x%04x", int(s / 65536), s % 65536 }')    # %x takes a 32-bit long on armv7
+for r in SUM_READ SUM_JUMP; do
+	v=$(printf 0x%08x $(( $(rd "$(def BOOTTRACE_$r)") )))
+	[ "$v" = "$slot" ] && verdict=matches || verdict="differs from the eMMC slot ($slot)"
+	echo "U-Boot sum, $( [ $r = SUM_READ ] && echo 'after the read' || echo 'at the jump   '): $v $verdict"
+done
+
+if [ $(( $(rd "$LOG") )) -ne $(( LOG_MAGIC )) ]; then
+	echo "log: none"
+else
+	n=$(( $(rd $(( LOG + 4 ))) ))
+	[ "$n" -le $(( LOG_SIZE - 8 )) ] || n=$(( LOG_SIZE - 8 ))
+	echo "log: $n bytes"
+	i=0
+	while [ "$i" -lt "$n" ]; do
+		w=$(( $(rd $(( LOG + 8 + i ))) ))
+		for b in 0 1 2 3; do
+			[ $(( i + b )) -lt "$n" ] && printf "\\$(printf %03o $(( (w >> (8 * b)) & 0xff )))"
+		done
+		i=$(( i + 4 ))
+	done
+	echo
+fi
+
+wr "$PROGRESS" 0
+wr "$(def BOOTTRACE_SUM_READ)" 0
+wr "$(def BOOTTRACE_SUM_JUMP)" 0
+wr "$LOG" 0

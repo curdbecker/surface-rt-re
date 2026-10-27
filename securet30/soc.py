@@ -6,10 +6,14 @@ transmit as a console log, PMC reset reason, the eMMC controller in sdhci.py) le
 AVP phase, then the A9 from the reset vector the AVP programmed, and translates through a page table it fills once
 the stage enables the MMU.
 
-It is an observation tool: it reports which path the code takes (visited blocks, cp15 accesses, console output, and
-where it stops or faults). Findings and the harness's assumptions: docs/surface-rt.md ("Firmware", Emulation).
+Because the boot ROM is not run, the harness supplies what it leaves behind, from the BCT: the BCT copy in IRAM that
+the Boot Information Table points to, and PLLM and the memory controller programmed from the selected SDRAM set.
+
+It is an observation tool: it reports which path the code takes (visited blocks, cp15 accesses, console output,
+accesses to hardware without a model, and where it stops or faults).
 """
 import collections
+import os
 import struct
 
 from unicorn import (Uc, UC_ARCH_ARM, UC_MODE_ARM, UC_PROT_ALL, UC_PROT_READ, UC_PROT_WRITE,
@@ -54,28 +58,41 @@ CP15_NAMES = {
 }
 APB_GP_HIDREV = 0x70000804      # chip id in bits [15:8]; 0x30 = Tegra30
 SDMMC4_BASE, SDMMC4_SIZE = 0x78000600, 0x200    # eMMC host controller (SDHCI); modeled in sdhci.py
-
-# First-stage-specific quirks (this bootloader build, not Tegra30-generic). The boot ROM normally hands the stage
-# the usable-DRAM extent; without it the heap context's free top is left inconsistent (below its own floor) and
-# every allocation fails. The harness supplies a top inside modeled DRAM so the heap works.
-HEAP_ALLOC = 0x8080a5f8         # allocator entry
-HEAP_CTX_OVERRIDE = 0x80875d0c  # active heap context pointer (0 -> use the default)
-HEAP_CTX_DEFAULT = 0x808566f4   # default heap context pointer
-HEAP_TOP = DRAM_BASE + 0x01f00000               # usable top we supply (kept low, clear of the staging buffer)
 PG_UP_TAG = 0x60000000          # reads 0x55555555 for the CPU complex, 0xaaaaaaaa for the AVP (COP)
-FLOW_HALT_COP = 0x60007004      # FLOW_CTLR_HALT_COP_EVENTS: the AVP writes FLOW_MODE here to halt itself
+FLOW_HALT_COP = 0x60007004      # FLOW_CTLR_HALT_COP_EVENTS: FLOW_MODE that halts (STOP) or runs (NONE) the AVP
+FLOW_MODE_STOP = 2 << 29
 EVP_CPU_RESET = 0x6000f100      # EVP CPU reset vector: the A9 entry the AVP programs before halting
+EVP_COP_RESET = 0x6000f200      # EVP COP reset vector: the AVP entry the A9 programs to restart it (the SPL)
 PMC_BASE = 0x7000e400
 PMC_PWRGATE_TOGGLE, PMC_PWRGATE_STATUS = 0x30, 0x38         # partition START | id -> toggles the id's status bit
+PMC_CNTRL, PMC_CNTRL_MAIN_RST = 0x0, 1 << 4                 # MAIN_RST: system reset (ends the run)
+PMC_SCRATCH0, PMC_SCRATCH0_RCM = 0x50, 1 << 1               # read by the boot ROM; RCM: enter USB recovery (APX)
 CAR_BASE = 0x60006000
 PLL_LOCK = 1 << 27          # LOCK bit in each CAR PLL*_BASE register
 PLL_BASES = {CAR_BASE + off for off in range(0x80, 0x100, 0x10)}            # PLLC/M/P/A/U/D/X base registers
 UART_THR = {u for u in UART_BASES}
 UART_LSR = {u + 0x14 for u in UART_BASES}
 
+# Boot ROM hand-over. Tegra30 BCT layout: NVIDIA cbootimage, src/t30/nvboot_bct_t30.h and nvboot_sdram_param_t30.h.
+_BCT = os.path.join(os.path.dirname(__file__), '..', 'data', 'spi-flash', 'leander-bct-decrypted.bin')
+BIT_BCT_PTR = IRAM_BASE + 0x3c      # Boot Information Table: address of the BCT copy in IRAM
+BCT_IRAM = IRAM_BASE + 0x20000      # where the harness puts that copy; the boot ROM's own placement is not known
+BCT_SDRAM_PARAMS, BCT_SDRAM_SIZE = 0x148, 0x300     # sdram_params[4]
+SDRAM_PLLM_DIVIDERS = 0xc           # pllm_input_divider (M), pllm_feedback_divider (N), pllm_post_divider (P)
+SDRAM_MC_EMEM_CFG = 0x2a4
+STRAPPING_OPT_A = 0x70000008        # RAM_CODE in bits [7:4]; its low two bits select the SDRAM set
+MC_EMEM_CFG = 0x7000f050            # DRAM size in MiB
+PLLM_BASE = CAR_BASE + 0x90
+PLL_ENABLE = 1 << 30
+# Reset values are not modelled (unwritten registers read 0); these stand in where code divides by a field:
+# PLLD_BASE and PLLD2_BASE with DIVM 1, disabled.
+RESET_STANDINS = {CAR_BASE + 0xd0: 1, CAR_BASE + 0x4b8: 1}
+
 
 class Tegra:
-    def __init__(self, image, *, trace=False):
+    def __init__(self, image, *, trace=False, boot0=None, boot1=None, bct=None):
+        """boot0/boot1: eMMC boot-area images (default the data/emmc dumps); bct: the decrypted BCT the boot ROM
+        hands over (default leander's, matching the default image)."""
         self.m = image if isinstance(image, Image) else Image(image)
         self.uc = uc = Uc(UC_ARCH_ARM, UC_MODE_ARM)
         uc.ctl_set_cpu_model(UC_CPU_ARM_CORTEX_A9)      # before any mapping: fixes MPIDR/CBAR and A9 cp15 decode
@@ -85,17 +102,20 @@ class Tegra:
         self.nblocks = 0                # total basic blocks entered (self.blocks keeps only the tail)
         self.us = 0                     # microsecond counter handed out at TMRUS
         self.pmc = {}                   # PMC byte offset -> value (e.g. reset status); default 0
-        self.mem = {}                   # MMIO word store: last value written, read back by default
+        self.mem = dict(RESET_STANDINS) # MMIO word store: last value written, read back by default
+        self.unmodelled = {}            # ('r'/'w', word address) -> [count, first pc] of accesses the store served
         self.fault = None               # (kind, address) if the run stopped on a memory fault
         self.halted = False             # set when the AVP halts itself at the FLOW controller
+        self.reset = None               # PMC_SCRATCH0 at the moment the code requested a system reset (MAIN_RST)
         self.mmu_on = False             # set when the stage turns the MMU on (page table filled by then)
         self.ttbr0 = 0x81ef8000         # L1 table base; refined from the stage's own TTBR0 write
         self.is_avp = True              # which core the model answers PG_UP_TAG as; A9 phase sets it False
         self.cpu_entry = None           # A9 reset vector the AVP programmed, captured at the halt
+        self.start_avp = False          # set when the A9 releases the AVP to run (restart handoff)
         self.phases = []                # (label, first block index, end reason) per run phase
         self.icount = 0                 # approximate instructions executed (sum of block sizes / 4)
         self.cp15 = []                  # (pc, 'mcr'/'mrc', name, spec, value) of each cp15/cp14 access, in order
-        self.sdhci = Sdhci(uc)          # eMMC host controller + card, backed by the boot-partition dumps
+        self.sdhci = Sdhci(uc, boot0, boot1)    # eMMC host controller + card, backed by the boot-area images
         self.sd_log = self.sdhci.cmd_log
         self._stop = set()              # PCs at which to stop the run
         self._hooks = {}                # va -> callable(Tegra) invoked when execution reaches va
@@ -109,6 +129,8 @@ class Tegra:
         uc.mmio_map(MMIO_BASE, MMIO_SIZE, self._mmio_read, None, self._mmio_write, None)
         for _, sva, sz, raw in self.m.secs:
             uc.mem_write(sva, self.m.b[raw:raw + sz])
+        with open(bct or _BCT, 'rb') as f:
+            self._bootrom_handover(f.read())
 
         uc.hook_add(UC_HOOK_BLOCK, self._on_block)
         uc.hook_add(UC_HOOK_MEM_UNMAPPED, self._on_unmapped)
@@ -138,7 +160,8 @@ class Tegra:
             return 0x60
         val = self.mem.get(addr & ~3, 0)
         if (addr & ~3) in PLL_BASES:        # report the PLL as locked so clock init proceeds
-            val |= PLL_LOCK
+            return val | PLL_LOCK
+        self._note_unmodelled('r', addr)
         return val
 
     def _mmio_write(self, uc, offset, size, value, _):
@@ -150,20 +173,47 @@ class Tegra:
             if self.uart_sink:
                 self.uart_sink(value & 0xff)
             return
-        if addr == FLOW_HALT_COP and (value >> 29) and self.mem.get(EVP_CPU_RESET):
-            self.mem[addr & ~3] = value & 0xffffffff        # FLOW_MODE set after the A9 vector exists: AVP halts
-            self.cpu_entry = self.mem[EVP_CPU_RESET]
-            self.halted = True
-            uc.emu_stop()
+        if addr == FLOW_HALT_COP:
+            self.mem[addr & ~3] = value & 0xffffffff
+            if self.is_avp and value & FLOW_MODE_STOP and self.mem.get(EVP_CPU_RESET):
+                self.cpu_entry = self.mem[EVP_CPU_RESET]     # AVP halts itself after programming the A9 vector
+                self.halted = True
+                uc.emu_stop()
+            elif not self.is_avp and not value & FLOW_MODE_STOP and self.mem.get(EVP_COP_RESET):
+                self.start_avp = True                        # the A9 released the AVP (FLOW_MODE_NONE) to restart
+                uc.emu_stop()
             return
         if PMC_BASE <= addr < PMC_BASE + 0x400:
             off = addr - PMC_BASE
+            if off == PMC_CNTRL and value & PMC_CNTRL_MAIN_RST:
+                self.reset = self.pmc.get(PMC_SCRATCH0, 0)
+                uc.emu_stop()
+                return
             if off == PMC_PWRGATE_TOGGLE and value & 0x100:        # START: flip the partition's status bit
                 self.pmc[PMC_PWRGATE_STATUS] = self.pmc.get(PMC_PWRGATE_STATUS, 0) ^ (1 << (value & 0x1f))
             self.pmc[off] = value & 0xffffffff
             return
+        if (addr & ~3) not in PLL_BASES:
+            self._note_unmodelled('w', addr)
         self.mem[addr & ~3] = value & 0xffffffff
         return
+
+    def _note_unmodelled(self, kind, addr):
+        n = self.unmodelled.get((kind, addr & ~3))
+        if n:
+            n[0] += 1
+        else:
+            self.unmodelled[(kind, addr & ~3)] = [1, self.uc.reg_read(UC_ARM_REG_PC)]
+
+    def _bootrom_handover(self, bct):
+        """Leave what the boot ROM leaves for the next stage: the BCT copy in IRAM, which the Boot Information Table
+        points to, and PLLM and the memory controller's DRAM size from the SDRAM set the RAM code selects."""
+        self.uc.mem_write(BCT_IRAM, bct)
+        self.uc.mem_write(BIT_BCT_PTR, struct.pack('<I', BCT_IRAM))
+        sdram = BCT_SDRAM_PARAMS + ((self.mem.get(STRAPPING_OPT_A, 0) >> 4) & 3) * BCT_SDRAM_SIZE
+        m, n, p = struct.unpack_from('<3I', bct, sdram + SDRAM_PLLM_DIVIDERS)
+        self.mem[PLLM_BASE] = PLL_ENABLE | p << 20 | n << 8 | m
+        self.mem[MC_EMEM_CFG] = struct.unpack_from('<I', bct, sdram + SDRAM_MC_EMEM_CFG)[0]
 
     # -- introspection ----------------------------------------------------
     def _on_block(self, uc, addr, size, _):
@@ -278,7 +328,9 @@ class Tegra:
             rem = 0 if not count else max(1, count - self.icount)
             try:
                 self.uc.emu_start(pc, SENTINEL, timeout=timeout, count=rem)
-                if self.halted:
+                if self.reset is not None:
+                    reason = 'reset'
+                elif self.halted:
                     reason = 'halted'
                 elif self.reg(UC_ARM_REG_PC) == SENTINEL:
                     reason = 'returned'
@@ -297,24 +349,21 @@ class Tegra:
                 break
         self.phases.append((label, at, reason))
 
-    def _fix_heap(self, _):
-        """Supply a usable heap top (see HEAP_TOP) when the context is left inconsistent by the missing boot ROM."""
-        import struct
-        ov = int.from_bytes(self.uc.mem_read(HEAP_CTX_OVERRIDE, 4), 'little')
-        ctx = ov or int.from_bytes(self.uc.mem_read(HEAP_CTX_DEFAULT, 4), 'little')
-        top = int.from_bytes(self.uc.mem_read(ctx + 0x20, 8), 'little')
-        floor = int.from_bytes(self.uc.mem_read(ctx + 0x28, 8), 'little')
-        if top < floor:
-            self.uc.mem_write(ctx + 0x20, struct.pack('<Q', HEAP_TOP))
-
-    def run(self, begin=None, *, count=0, timeout=0, handoff=True, supply_heap=True):
-        """Run from the AVP entry (or begin). When handoff is set, follow the AVP->A9 reset into a second phase."""
-        if supply_heap:
-            self.at(HEAP_ALLOC, self._fix_heap)
+    def run(self, begin=None, *, count=0, timeout=0, handoff=True):
+        """Run from the AVP entry (or begin), following each hand-off between the cores into a further phase:
+        the AVP halting itself hands the A9 its reset vector, and the A9 releasing the AVP (the stub restarting it
+        for the SPL) hands it back, so a full boot runs AVP (stage) -> A9 (stage, stub) -> AVP (SPL) -> A9 (U-Boot)."""
         self._phase('AVP' if begin is None else 'start',
                     self.m.base + self.m.entry if begin is None else begin, count, timeout)
-        if handoff and self.halted and self.cpu_entry:
-            self.halted = False
-            self.is_avp = False
-            self._phase('A9', self.cpu_entry, count, timeout)
+        while handoff:
+            if self.halted and self.cpu_entry is not None:
+                self.halted = False
+                self.is_avp = False
+                self._phase('A9', self.cpu_entry, count, timeout)
+            elif self.start_avp and self.mem.get(EVP_COP_RESET):
+                self.start_avp = False
+                self.is_avp = True
+                self._phase('AVP', self.mem[EVP_COP_RESET], count, timeout)
+            else:
+                break
         return self

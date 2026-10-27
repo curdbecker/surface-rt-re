@@ -59,13 +59,26 @@ the block selectors. Normal boot uses types `0xb`/`0xe` (boot1); a watchdog rese
 the image and signature are redundant; the table and the `UEFIDATA` block exist once, and load address and entry
 offset are shared by both copies, so a damaged block affects both.
 
-## The unsigned metadata and the entry_offset hijack
+## The unsigned metadata: a pre-verification write and the entry_offset hijack
 
-The signature covers the image bytes, not the `UEFIDATA` block. The jump target is `load_address + entry_offset`,
-both taken from the **unsigned** `UEFIDATA` copy (`uefidata`, fields `+0x40` and `+0x48`), through `bx r0` at
-`uefi_jump` with no range check. So a payload placed in the unused tail of the `UEFIDATA` block, with
-`entry_offset` pointed at it, runs after a genuine, successful verification of the untouched image — demonstrated
-in the emulator (`securet30 run --payload`, `payloads/uart_stub.S`).
+The PKCS#7 signature covers the image bytes alone. Everything that says *where* those bytes land and *where
+execution goes* is unsigned, in the `NVDAUEFI` table and the `UEFIDATA` block, both in the eMMC boot partitions.
+
+`read_image_block` copies `uefidata.image_size` (`+0x38`) bytes from the image entry's device and offset to
+`uefidata.load_address` (`+0x40`) before `Pkcs7Verify` runs, with no bounds check on the destination. After a
+watchdog reset it takes the backup image entry and `backup_image_size` (`+0x50`) instead, as long as that entry's
+offset and size and both backup sizes in `UEFIDATA` are nonzero (otherwise the normal entry). Source, length and
+destination all come from the unsigned table and `UEFIDATA`, and the check comes after the copy. So the unsigned
+metadata is an unauthenticated write into the running Secure-world stage, before trust is established, and **the
+signed image is not load-bearing**: point the image entry at a small payload, `image_size` at its length and
+`load_address` at the `Pkcs7Verify` entry, and the stage's own `bl Pkcs7Verify` runs the payload — no genuine
+image, no signature, no trust anchor. Shown in the emulator: with the image entry (type `0x0b`) repointed to the
+84-byte `payloads/uart_stub.bin`, `image_size` set to one block and `load_address` to `Pkcs7Verify`, the stage
+prints the payload's line and finishes without loading the image (`0x80108000` stays zero) or running the verify.
+
+The milder variant keeps the genuine image: the jump target is `load_address + entry_offset` (`+0x40`, `+0x48`),
+through `bx r0` at `uefi_jump` with no range check, so a payload in the unused `UEFIDATA` tail with `entry_offset`
+pointed at it runs after a real, successful verification (`securet30 run --payload`, `payloads/uart_stub.S`).
 
 ## The main UEFI and its secure monitor (`SurfaceRTUEFI.bin`)
 
@@ -106,6 +119,18 @@ appended `NVDASPICERTIFICA` trust anchor is what `Pkcs7Verify` checks against, s
 fails in the ASN.1 parse. `Image` unwraps the volume and maps it whole, so verification succeeds as on hardware.
 
 Supplied because the boot ROM is not run: the page table at the stage's own `TTBR0` (`_build_pt` fills it with
-1 MiB sections, identity from `0x40000000` up and the low 0-based range aliased to DRAM at `0x80000000`), the
-0-based stack backed by real RAM, and the heap top and usable-DRAM extent. The fidelity of the hardware model is
-an assumption, not a measurement.
+1 MiB sections, identity from `0x40000000` up and the low 0-based range aliased to DRAM at `0x80000000`) and the
+0-based stack backed by real RAM. From the BCT (layout after NVIDIA's cbootimage, `src/t30`), what the boot ROM
+leaves for later stages: a copy of the BCT in IRAM that the Boot Information Table points to (`+0x3c`; U-Boot
+reads ODMDATA through it), and PLLM and `MC_EMEM_CFG` (DRAM size in MiB) from the SDRAM set the RAM-code strap
+selects. Our BCT's four sets all give 2048 MiB and M = 12, N = 750, except set 1 (N = 667). With that DRAM size
+the stage sizes its own heap (`0x80888120` up to `0xffee0000`). Reset values are not modelled (unwritten registers read 0); PLLD and PLLD2 stand in with
+DIVM 1, because U-Boot's `clock_init` divides by it and the APX path, where nothing programs PLLD2, shows that
+the real reset value is nonzero. The fidelity of the hardware model is an assumption, not a measurement.
+
+Followed into the installed boot (`--boot0` with an installed boot0): the emulator runs the stage, the stub, and
+the stub's hand-off to the AVP, and from there U-Boot's SPL (a second AVP phase; its banner on UART A). It stops
+partway through SPL's clock init, which reads flow-controller registers the model does not cover, so it does not
+reach U-Boot proper. The first stage touches no PL310 (the L2 cache stays off) and leaves PLLP at 408 MHz, PLLX
+at 1 GHz (the CPU's clock), PLLC at 650 MHz and PLLU at 960 MHz (13 MHz oscillator), PLLD and PLLD2 unprogrammed
+— the last two the reason SPL's `clock_early_init` is needed (boot-chain.md).

@@ -1,0 +1,36 @@
+initramfs: debug shell: kernel console font, on-screen keyboard after a countdown
+
+The debug shell sets a 28 px Terminus font and starts buffyboard (meant for phones). On the Surface RT's
+1366x768 panel with its detachable Type/Touch Cover:
+- the kernel's 8x16 console font is kept: 23 shell rows above buffyboard instead of 13, 48 without it;
+- buffyboard starts after a 5 s countdown on the display console; a key press on a physical keyboard skips it.
+  A running buffyboard is hidden with pkill buffyboard, which restores the full terminal height.
+Local to the Surface RT image.
+
+Applies after 0001, to postmarketos-initramfs (usr/share/initramfs/init_functions.sh), with patch -p1 from the root.
+
+--- a/usr/share/initramfs/init_functions.sh
++++ b/usr/share/initramfs/init_functions.sh
+@@ -1198,10 +1198,18 @@
+ 	# buffyboard is only available with merged initramfs-extra!
+ 	if command -v buffyboard 2>/dev/null && \
+ 	   echo "handset tablet convertible" | grep "${deviceinfo_chassis:-handset}" >/dev/null; then
+-		modprobe uinput
+-		# Set a large font for the framebuffer
+-		setfont "/usr/share/consolefonts/ter-128n.psf.gz" -C "/dev/$active_console"
+-		buffyboard &
++		# Start the on-screen keyboard unless a key on a physical keyboard is pressed during the countdown
++		_osk_wait=5
++		while [ "$_osk_wait" -gt 0 ]; do
++			printf '\rPress any key to skip the on-screen keyboard (%s) ' "$_osk_wait" > "/dev/$active_console"
++			read -r -s -n 1 -t 1 _osk_key < "/dev/$active_console" && break
++			_osk_wait=$((_osk_wait - 1))
++		done
++		echo > "/dev/$active_console"
++		if [ "$_osk_wait" -eq 0 ]; then
++			modprobe uinput
++			buffyboard &
++		fi
+ 	fi
+ 	run_getty "$active_console"
+ 

@@ -1,0 +1,52 @@
+/* Generated from securet30sec_loader.FUNCTIONS by function_defines(). */
+#ifndef SECURET30SEC_FUNCTIONS_H
+#define SECURET30SEC_FUNCTIONS_H
+#define FN__ModuleEntryPoint 0x80808158
+#define FN_read_trusted_cert 0x80808494
+#define FN_decide_use_backup 0x808084e0
+#define FN_emmc_read 0x80808514
+#define FN_read_signature_block 0x808085c8
+#define FN_read_image_block 0x808086cc
+#define FN_uefidata_read 0x80808790
+#define FN_find_nvdauefi_table 0x8080884c
+#define FN_nv_verify_image 0x808088e8
+#define FN_Pkcs7Verify 0x80808afc
+#define FN_pinmux_setup_sdmmc4 0x80808c78
+#define FN_load_uefi 0x80808dec
+#define FN_heap_alloc 0x8080a5f8
+#define FN_reset_was_watchdog 0x8080b60c
+#define FN_wdt_arm 0x8080b67c
+#define FN_mmio_read32 0x8080b78c
+#define FN_mmio_write32 0x8080b794
+#define FN_tlb_bp_invalidate_all 0x8080b81c
+#define FN_read_ccsidr 0x8080b8b0
+#define FN_dcache_line_invalidate 0x8080b9b0
+#define FN_dcache_line_clean_invalidate 0x8080b9c0
+#define FN_dcache_line_clean 0x8080b9d0
+#define FN_icache_invalidate_all 0x8080b9e0
+#define FN_mmu_disable 0x8080ba14
+#define FN_dcache_disable 0x8080ba58
+#define FN_icache_disable 0x8080ba90
+#define FN_dcache_iterate_setway 0x8080bbfc
+#define FN_dcache_clean_invalidate_all 0x8080bc3c
+#define FN_CompareMem 0x8080bef4
+#define FN_CopyMem 0x8080bf1c
+#define FN_memset16 0x8080bf3c
+#define FN_memset32 0x8080bf54
+#define FN_memmove 0x8080c1c8
+#define FN_ERR_put_error 0x8080ebb1
+#define FN_OpenSSLDie 0x8081669d
+#define FN_CRYPTO_malloc_locked 0x808169fd
+#define FN_CRYPTO_realloc 0x80816b49
+#define FN_CRYPTO_push_info_ 0x80816c29
+#define FN_CRYPTO_realloc_clean 0x80816c65
+#define FN_CRYPTO_malloc 0x808176b9
+#define FN_sd_send_cmd 0x8084ad60
+#define FN_sd_read_blocks 0x8084b27c
+#define FN_emmc_select_partition 0x8084beac
+#define FN_nv_sha256 0x8084d578
+#define FN_nv_rsa 0x8084d8c8
+#define FN_setup_memory_map 0x8084eac4
+#define FN_parse_nvdauefi_table 0x8084f5d8
+#define FN_memcpy 0x8084ffc0
+#endif

@@ -4,9 +4,10 @@ bootloader (firmware volume + NVDASPICERTIFICA block, e.g. data/surface-rt/spi-f
 
 The boot ROM loads the blob to LOAD_BASE and the TE sections run in place (section address = LOAD_BASE + blob
 offset), so the blob is mapped as one image, split into segments by its structure. The loader adds the .reloc
-fixups, the Tegra30 blocks the stage addresses (sparse), and the known functions, data, registers and types below;
-the reset vector is ARM and IDA follows the switches into Thumb. Findings behind the tables: docs/surface-rt.md
-("Firmware"). The tables are plain data, importable without IDA. Targets IDA 9.x.
+fixups, the Tegra30 blocks the stage addresses (sparse), the known functions, data and registers below, and the
+types and enums of securet30sec.h (shared with the installer and the payloads; read_header gives its C view,
+LAYOUTS the struct offsets); the reset vector is ARM and IDA follows the switches into Thumb. Findings behind the
+tables: docs/firststage.md. The tables are plain data, importable without IDA. Targets IDA 9.x.
 
 OpenSSL (securet30sec_openssl.h/.json, from gen_securet30sec_openssl.py): the header is parsed at load time; after
 auto-analysis identify() names OpenSSL functions and applies the header's prototypes. Run this file as a script to
@@ -152,8 +153,9 @@ FUNCTIONS = {
                  'EFI_STATUS parse_nvdauefi_table(NVDAUEFI_CTX *ctx, void *candidate);'),
     0x8080bef4: ('CompareMem', False, 'EDK2 CompareMem/memcmp: returns 0 when equal; no-op (0) when dst==src or n==0',
                  'int CompareMem(const void *a, const void *b, unsigned int n);'),
-    0x808086cc: ('read_image_block', False, 'reads ctx.image (or ctx.image_backup when use_backup_copy) to the '
-                 'caller-supplied load address; ctx and uefidata are passed by value',
+    0x808086cc: ('read_image_block', False, 'reads uefidata.image_size bytes of ctx.image to the caller-supplied '
+                 'load address; with use_backup_copy, uefidata.backup_image_size bytes of ctx.image_backup, if its '
+                 'offset and size and both uefidata backup sizes are nonzero; ctx and uefidata are passed by value',
                  'EFI_STATUS read_image_block(NVDAUEFI_CTX ctx, UEFIDATA_HEADER uefidata, void *load_dest);'),
     0x808085c8: ('read_signature_block', False, 'reads ctx.signature (or ctx.signature_backup) NVDASPISIGNATURE block '
                  'and unwraps it: *out_P7Data = block+0x14 (DER), *out_P7Length = *(u32 *)(block+0x10)',
@@ -224,9 +226,10 @@ LABELS = {
 # Data: address -> (name, type, comment).
 DATA = {
     0x808566f4: ('heap_ctx_default', 'HEAP_CONTEXT *', None),
-    0x80856718: ('wdt_timeout_ms', 'unsigned int', None),
+    0x80856718: ('wdt_timeout_ms', 'unsigned int', 'WDT0 period load_uefi arms before Pkcs7Verify'),
     0x80856720: ('use_backup_on_wdt_reset', 'unsigned int', 'after a watchdog reset, use the boot0 copy '
-                 '(NVDAUEFI types 0xd/0x10)'),
+                 '(NVDAUEFI types 0xd/0x10); when set, load_uefi also arms WDT0 (wdt_timeout_ms) before '
+                 'Pkcs7Verify, so a hang there resets into it'),
     0x80875c78: ('emmc_geometry', 'EMMC_GEOMETRY', None),
     0x80875d08: ('use_backup_copy', 'u8', 'decide_use_backup result: use the boot0 backup NVDAUEFI entries'),
     0x80875d0c: ('heap_ctx', 'HEAP_CONTEXT *', 'active heap context; 0 -> heap_ctx_default'),
@@ -235,120 +238,137 @@ DATA = {
     0x80876830: ('uefidata', 'UEFIDATA_HEADER', 'copy of the UEFIDATA block (unsigned), from uefidata_read'),
 }
 
-TYPES = r'''
-typedef unsigned char u8;
-typedef unsigned short u16;
-typedef unsigned int u32;
-typedef unsigned long long u64;
-typedef u32 EFI_STATUS;             /* EDK2 status; high bit set = error (EFI_SUCCESS = 0) */
+HEADER = os.path.join(HERE, 'securet30sec.h')
+_DIRECTIVE = re.compile(r'#\s*(\w+)\s*(.*)')
 
-struct NVDA_BLOCK {                 /* NVDASPICERTIFICA / NVDASPISIGNATURE: name, length, DER */
-    char name[16];
-    u32 length;
-};
 
-struct NVDAUEFI_ENTRY {             /* device 0 = boot device (SPI), 1 = boot0, 2 = boot1 */
-    u32 type;
-    u32 device;
-    u64 offset;
-    u64 size;
-    u64 load_address;
-    u8 reserved[16];
-};
+def read_header(path, include_dirs=(HERE,)):
+    """Read a header shared with the assembler the way C sees it (__ASSEMBLER__ undefined): (defines, declarations).
 
-struct NVDAUEFI_TABLE {             /* 0x400 bytes, searched in 16 KiB steps over boot0/boot1 */
-    char magic[8];                  /* "NVDAUEFI" */
-    u32 unknown_08;
-    u8 unknown_0c[0x20];
-    u32 count;
-    struct NVDAUEFI_ENTRY entries[20];
-    u8 tail[0x10];
-};
+    Supports the subset the shared headers use: #include "file" (beside the including file, then in include_dirs),
+    #define NAME [VALUE], #ifdef/#ifndef/#else/#endif, and comments. A value is an int, a "string", or the name of
+    an earlier define.
+    """
+    defines, decls = {}, []
 
-struct UEFIDATA_HEADER {            /* first 0x280 bytes of the UEFIDATA block (NVDAUEFI type 0x11) */
-    u8 unknown_00[0x20];
-    char tag[8];                    /* "UEFIDATA" */
-    u32 unknown_28;
-    u32 unknown_2c;
-    u32 unknown_30;
-    u32 unknown_34;
-    u32 image_size;                 /* checked length, normal copy */
-    u32 signature_size;
-    u64 load_address;               /* shared by both copies */
-    u64 entry_offset;               /* shared by both copies */
-    u32 backup_image_size;          /* boot0 copy */
-    u32 backup_signature_size;
-    u64 backup_load_address;
-    u8 unknown_60[0x220];
-};
+    def value(text):
+        text = text.strip()
+        if not text:
+            return None
+        if text.startswith('"'):
+            return text[1:-1]
+        if text in defines:
+            return defines[text]
+        return int(text, 0)
 
-struct EMMC_GEOMETRY {
-    u32 unknown_00;
-    u32 unknown_04;
-    u32 boot_size;
-    u32 block_length;
-    u32 capacity;
-};
+    def read(p):
+        with open(p) as f:
+            src = f.read()
+        src = re.sub(r'/\*.*?\*/', lambda m: '\n' * m.group().count('\n'), src, flags=re.S)
+        src = re.sub(r'//[^\n]*', '', src)
+        active = [True]
+        for line in src.splitlines():
+            m = _DIRECTIVE.match(line.strip())
+            if not m:
+                if all(active):
+                    decls.append(line)
+                continue
+            op, arg = m.groups()
+            if op in ('ifdef', 'ifndef'):
+                active.append((arg.split()[0] in defines) == (op == 'ifdef'))
+            elif op == 'else':
+                active[-1] = not active[-1]
+            elif op == 'endif':
+                active.pop()
+            elif not all(active):
+                continue
+            elif op == 'define':
+                name, _, rest = arg.partition(' ')
+                defines[name] = value(rest)
+            elif op == 'include':
+                name = arg.strip()[1:-1]
+                for d in (os.path.dirname(p),) + tuple(include_dirs):
+                    if os.path.exists(os.path.join(d, name)):
+                        read(os.path.join(d, name))
+                        break
+                else:
+                    raise ValueError('%s: cannot find %s' % (p, name))
+            else:
+                raise ValueError('%s: unsupported directive #%s' % (p, op))
 
-struct NVDAUEFI_SLOT {             /* one NVDAUEFI entry demultiplexed by type (fields from NVDAUEFI_ENTRY) */
-    u64 offset;
-    u64 size;
-    u32 device;
-    u32 pad;
-};
+    read(path)
+    return defines, '\n'.join(decls)
 
-struct NVDAUEFI_SLOT5 {            /* a demultiplexed entry that also carries a load address and a trailing word */
-    u64 offset;
-    u64 size;
-    u32 device;
-    u32 pad;
-    u64 load_address;
-    u64 extra;
-};
 
-struct NVDAUEFI_CTX {              /* parse_nvdauefi_table pivots the table by entry type into these fixed slots */
-    struct NVDAUEFI_SLOT  bct;              /* type 0x01 */
-    struct NVDAUEFI_SLOT5 first_stage;      /* type 0x03 */
-    struct NVDAUEFI_SLOT  var_store;        /* type 0x04 */
-    struct NVDAUEFI_SLOT  nvdauefi_table;   /* type 0x02 */
-    struct NVDAUEFI_SLOT  type_05;
-    struct NVDAUEFI_SLOT  type_06;
-    struct NVDAUEFI_SLOT  type_07;
-    struct NVDAUEFI_SLOT  type_08;
-    struct NVDAUEFI_SLOT  type_09;
-    struct NVDAUEFI_SLOT  type_0a;
-    struct NVDAUEFI_SLOT5 image;            /* type 0x0b (normal copy, boot1) */
-    struct NVDAUEFI_SLOT5 type_0c;
-    struct NVDAUEFI_SLOT  signature;        /* type 0x0e (normal copy, boot1) */
-    struct NVDAUEFI_SLOT  type_0f;
-    struct NVDAUEFI_SLOT5 image_backup;     /* type 0x0d (used after a watchdog reset, boot0) */
-    struct NVDAUEFI_SLOT  signature_backup; /* type 0x10 (boot0) */
-    struct NVDAUEFI_SLOT  uefidata;         /* type 0x11 */
-    struct NVDAUEFI_SLOT  empty_13;         /* type 0x13 */
-    struct NVDAUEFI_SLOT  type_14;
-    struct NVDAUEFI_SLOT  type_15;
-    struct NVDAUEFI_SLOT5 type_16;
-    struct NVDAUEFI_SLOT  type_17;          /* type 0x17 is skipped by the parser; slot stays zero */
-    struct NVDAUEFI_SLOT5 type_18;
-    struct NVDAUEFI_SLOT  tail;
-};
+Field = collections.namedtuple('Field', 'offset size')
+Struct = collections.namedtuple('Struct', 'size align fields')
+_BASE_SIZES = {'char': 1, 'unsigned char': 1, 'short': 2, 'unsigned short': 2, 'int': 4, 'unsigned int': 4,
+               'long long': 8, 'unsigned long long': 8}
+_POINTER_SIZE = 4                   # 32-bit ARM
 
-struct HEAP_CONTEXT {
-    u8 unknown_00[0x20];
-    u64 top;
-    u64 floor;
-};
 
-typedef struct NVDA_BLOCK NVDA_BLOCK;
-typedef struct NVDAUEFI_ENTRY NVDAUEFI_ENTRY;
-typedef struct NVDAUEFI_TABLE NVDAUEFI_TABLE;
-typedef struct UEFIDATA_HEADER UEFIDATA_HEADER;
-typedef struct EMMC_GEOMETRY EMMC_GEOMETRY;
-typedef struct NVDAUEFI_SLOT NVDAUEFI_SLOT;
-typedef struct NVDAUEFI_SLOT5 NVDAUEFI_SLOT5;
-typedef struct NVDAUEFI_CTX NVDAUEFI_CTX;
-typedef struct HEAP_CONTEXT HEAP_CONTEXT;
-'''
+def struct_layouts(decls, defines):
+    """name -> Struct(size, align, fields: name -> Field(offset, size)) for each struct in decls (natural alignment).
+
+    Supports what the header declares: scalar and struct typedefs, struct fields of those types, pointers, and
+    arrays sized by a number or a define.
+    """
+    types = {k: (v, v) for k, v in _BASE_SIZES.items()}            # type -> (size, alignment)
+    layouts = {}
+    for m in re.finditer(r'typedef\s+([^;{]+?)\s+(\w+)\s*;|struct\s+(\w+)\s*\{([^}]*)\}\s*;', decls):
+        if m.group(2):
+            types[m.group(2)] = types[' '.join(m.group(1).split())]
+            continue
+        name, body = m.group(3), m.group(4)
+        offset, align, fields = 0, 1, {}
+        for stmt in body.split(';'):
+            stmt = ' '.join(stmt.split())
+            if not stmt:
+                continue
+            f = re.match(r'(.*?)(\s*\*\s*|\s+)(\w+)(?:\s*\[\s*(\w+)\s*\])?$', stmt)
+            type_, ptr, field, count = f.groups()
+            size, al = (_POINTER_SIZE, _POINTER_SIZE) if '*' in ptr else types[type_]
+            n = 1 if count is None else defines[count] if count in defines else int(count, 0)
+            offset = -(-offset // al) * al
+            fields[field] = Field(offset, size * n)
+            offset += size * n
+            align = max(align, al)
+        size = -(-offset // align) * align
+        types['struct ' + name] = (size, align)
+        layouts[name] = Struct(size, align, fields)
+    return layouts
+
+
+DEFINES, TYPES = read_header(HEADER)
+LAYOUTS = struct_layouts(TYPES, DEFINES)
+
+# Sizes the stage's own code fixes, as a check on the header: it steps the table entries by 0x30, reads the table
+# 0x400 bytes at a time, copies 0x280 bytes of UEFIDATA, and passes the 0x2a0-byte context by value.
+for _name, _size in (('NVDAUEFI_ENTRY', 0x30), ('NVDAUEFI_TABLE', 0x400), ('UEFIDATA_HEADER', 0x280),
+                     ('NVDAUEFI_CTX', 0x2a0)):
+    if LAYOUTS[_name].size != _size:
+        raise ValueError('%s: %s is %#x bytes, the first stage uses %#x' % (HEADER, _name, LAYOUTS[_name].size, _size))
+
+ENUM_PREFIXES = ('NVDAUEFI_DEVICE_', 'NVDAUEFI_TYPE_')      # #define groups the database gets as enums
+
+
+def enum_decls():
+    """IDA enum declarations, one per ENUM_PREFIXES group of DEFINES."""
+    return '\n'.join('enum %s { %s };' % (p[:-1], ', '.join('%s = %#x' % (k, v) for k, v in DEFINES.items()
+                                                             if k.startswith(p)))
+                     for p in ENUM_PREFIXES)
+
+
+SYMBOLS = {v[0]: ea for ea, v in list(FUNCTIONS.items()) + list(LABELS.items()) if v[0]}   # name -> address
+
+
+def function_defines():
+    """Header text for assembly payloads: FN_<name> for each FUNCTIONS address (bit 0 set for Thumb code)."""
+    lines = ['/* Generated from securet30sec_loader.FUNCTIONS by function_defines(). */',
+             '#ifndef SECURET30SEC_FUNCTIONS_H', '#define SECURET30SEC_FUNCTIONS_H']
+    lines += ['#define FN_%s %#x' % (name, ea | int(thumb)) for ea, (name, thumb, _, _) in sorted(FUNCTIONS.items())]
+    lines.append('#endif')
+    return '\n'.join(lines) + '\n'
 
 
 def layout(blob):
@@ -517,7 +537,7 @@ def apply_labels():
     refreshes the loader's own auto-generated symbols and leaves user names (names, types and comments) untouched.
     Returns the OpenSSL prototype map, for the caller to drive identify()/the analysis hook.
     """
-    if ida_typeinf.parse_decls(None, TYPES, None, ida_typeinf.HTI_DCL) != 0:
+    if ida_typeinf.parse_decls(None, TYPES + '\n' + enum_decls(), None, ida_typeinf.HTI_DCL) != 0:
         print('securet30sec_loader: errors in the type declarations')
     protos = _import_openssl()
     for ea, (name, width, cmt) in REGISTERS.items():
