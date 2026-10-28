@@ -1,7 +1,7 @@
 """Command line for the Surface RT first-stage emulator.
 
     python -m securet30 run IMAGE [--begin VA] [--stop SYM|VA ...] [--timeout SEC] [--count N]
-                                  [--reset N] [--trace] [--regs] [--stack N] [--live] [--mmio]
+                                  [--reset N] [--trace] [--regs] [--stack N] [--live] [--mmio [BLOCK|LO-HI ...]]
                                   [--boot0 FILE] [--boot1 FILE] [--bct FILE] [--uboot-map FILE]
                                   [--payload FILE] [--payload-offset OFF]
 
@@ -10,7 +10,7 @@ instruction budget), and the tail of the basic-block trace. The run is unlimited
 loader symbol or address, --timeout bounds the wall clock, --count caps instructions. --reset sets PMC_RST_STATUS
 (the boot ROM reset reason). --trace prints every instruction (slow). --regs and --stack dump the core registers
 and stack at the stop, --stack with the code addresses found on it. --mmio lists the accesses to hardware without
-a model. --boot0/--boot1 back the eMMC boot areas with other images (an installed U-Boot, say), --bct is the BCT
+a model; given blocks or ranges, it logs every access to them instead. --boot0/--boot1 back the eMMC boot areas with other images (an installed U-Boot, say), --bct is the BCT
 the boot ROM hands over, and --uboot-map (U-Boot's System.map) symbolizes U-Boot proper, relocated or not.
 --payload injects a raw ARM binary into the unsigned UEFIDATA tail and runs it after verify; --live streams the
 UART and a per-block status line.
@@ -23,7 +23,7 @@ import sys
 from unicorn.arm_const import (UC_ARM_REG_PC, UC_ARM_REG_SP,
                                UC_ARM_REG_R0, UC_ARM_REG_R1)
 
-from .soc import Tegra
+from .soc import Tegra, PMC_RST_STATUS
 
 
 def _symbolizer(uboot=None):
@@ -83,6 +83,28 @@ def _resolve(tokens):
     return [names[tok] if tok in names else int(tok, 16) for tok in tokens]
 
 
+def _range(spec):
+    """A loader Tegra30 block name or a hex 'LO-HI' range -> (start, end)."""
+    from securet30sec_loader import TEGRA30_BLOCKS
+    if spec in TEGRA30_BLOCKS:
+        return TEGRA30_BLOCKS[spec]
+    lo, sep, hi = spec.partition('-')
+    if not sep:
+        raise SystemExit('--mmio %s: not a block (%s) nor LO-HI' % (spec, ', '.join(TEGRA30_BLOCKS)))
+    return int(lo, 16), int(hi, 16)
+
+
+def _reg_name(addr):
+    """The loader's register name, else block+offset, with the address."""
+    from securet30sec_loader import REGISTERS, TEGRA30_BLOCKS
+    if addr in REGISTERS:
+        return '%s (%#x)' % (REGISTERS[addr][0], addr)
+    for name, (lo, hi) in TEGRA30_BLOCKS.items():
+        if lo <= addr < hi:
+            return '%s+%#x (%#x)' % (name, addr - lo, addr)
+    return '%#x' % addr
+
+
 def _live(t, sym):
     """UART flows like a terminal and a debugger-style status line stays pinned below it (every 1M blocks)."""
     tty = sys.stdout.isatty()
@@ -128,7 +150,10 @@ def _add_run(sub):
     r.add_argument('--stack', type=int, nargs='?', const=16, default=0, metavar='N',
                    help='dump N stack words at the stop (default 16)')
     r.add_argument('--live', action='store_true', help='stream UART output and a status heartbeat as the run goes')
-    r.add_argument('--mmio', action='store_true', help='list the accesses to hardware without a model')
+    r.add_argument('--mmio', nargs='*', metavar='BLOCK|LO-HI',
+                   help='without arguments, list the accesses to hardware without a model; with Tegra30 blocks of '
+                        'the loader (e.g. GIC SCU L2C FLOW PMC MC) or hex address ranges, log every access to them '
+                        'in order, with the model that served it (store: none)')
     r.add_argument('--boot0', metavar='FILE', help='eMMC boot area 1 image (default data/emmc/boot0.bin)')
     r.add_argument('--boot1', metavar='FILE', help='eMMC boot area 2 image (default data/emmc/boot1.bin)')
     r.add_argument('--bct', metavar='FILE', help='decrypted BCT the boot ROM hands over (default leander\'s)')
@@ -151,7 +176,7 @@ def main(argv=None):
 def _cmd_run(a):
     count = a.count or 0            # no default budget; the user bounds the run with --count/--stop/--timeout
     t = Tegra(a.image, trace=a.trace, boot0=a.boot0, boot1=a.boot1, bct=a.bct)
-    t.pmc[0x1b4] = a.reset                       # PMC_RST_STATUS at 0x7000e5b4
+    t.pmc[PMC_RST_STATUS] = a.reset
     uboot = None
     if a.uboot_map:
         from .uboot import UBootSymbols
@@ -165,6 +190,7 @@ def _cmd_run(a):
         _live(t, sym)
     if a.stop:
         t.stop_at(*_resolve(a.stop))
+    t.log_ranges = [_range(s) for s in a.mmio or ()]
     t.run(a.begin, count=count, timeout=int(a.timeout * 1_000_000))
 
     if a.live and sys.stdout.isatty():
@@ -197,10 +223,17 @@ def _cmd_run(a):
         for i, w in enumerate(words):
             if sym(w):
                 print('  sp+%#05x  %#010x %s' % (4 * i, w, sym(w)))
-    if a.mmio:
+    if a.mmio == []:
         print('--- accesses to hardware without a model (served by the read-back store) ---')
         for (kind, addr), (n, first) in sorted(t.unmodelled.items(), key=lambda e: e[0][1]):
             print('  %s %#010x  x%-6d first at %#x %s' % (kind, addr, n, first, sym(first)))
+    elif a.mmio:
+        print('--- accesses to %s (phase, core, pc, r/w, register, value, model; store: none) ---'
+              % ', '.join(a.mmio))
+        for ph, core, pc, kind, addr, size, value, model, n in t.access_log:
+            print('  %d %-3s %#010x %-28s %s %-30s %s %#0*x  %s%s'
+                  % (ph, core, pc, sym(pc), kind, _reg_name(addr), '<-' if kind == 'w' else '->',
+                     2 + 2 * size, value, model, '  x%d' % n if n > 1 else ''))
     if t.console:
         print('--- UART console ---')
         print(t.console.decode('latin1'))

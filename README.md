@@ -199,7 +199,8 @@ uv run python -m securet30 run data/spi-flash/leander-bootloader-decrypted.bin -
 
 `--regs`/`--stack` give register and stack context at the stop; `--live` flows the UART like a terminal with a
 debugger-style status line pinned below it (PC resolved to the nearest loader symbol); `--mmio` lists the accesses
-to hardware without a model; hook `Tegra.at(va, fn)` for intermediate state.
+to hardware without a model, and `--mmio BLOCK|LO-HI ...` (a Tegra30 block of the loader, such as `GIC` or `PMC`,
+or a hex range) logs every access to them in order, each with the model that served it (`store`: none); hook `Tegra.at(va, fn)` for intermediate state.
 
 ### Running your own code
 

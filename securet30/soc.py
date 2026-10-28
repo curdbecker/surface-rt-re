@@ -2,7 +2,8 @@
 
 The harness maps the image into DRAM, maps IRAM, and backs the peripheral aperture with a register model: registers
 without a model read back what was last written; the live ones (PLL lock, power-gating, microsecond counter, UART
-transmit as a console log, PMC reset reason, the eMMC controller in sdhci.py) let the code make progress. It runs the
+transmit as a console log, PMC reset reason, the L2 cache controller's ID and maintenance operations, the eMMC
+controller in sdhci.py) let the code make progress. It runs the
 AVP phase, then the A9 from the reset vector the AVP programmed, and translates through a page table it fills once
 the stage enables the MMU.
 
@@ -10,7 +11,7 @@ Because the boot ROM is not run, the harness supplies what it leaves behind, fro
 the Boot Information Table points to, and PLLM and the memory controller programmed from the selected SDRAM set.
 
 It is an observation tool: it reports which path the code takes (visited blocks, cp15 accesses, console output,
-accesses to hardware without a model, and where it stops or faults).
+accesses to hardware without a model, the accesses to chosen address ranges, and where it stops or faults).
 """
 import collections
 import os
@@ -67,6 +68,10 @@ PMC_BASE = 0x7000e400
 PMC_PWRGATE_TOGGLE, PMC_PWRGATE_STATUS = 0x30, 0x38         # partition START | id -> toggles the id's status bit
 PMC_CNTRL, PMC_CNTRL_MAIN_RST = 0x0, 1 << 4                 # MAIN_RST: system reset (ends the run)
 PMC_SCRATCH0, PMC_SCRATCH0_RCM = 0x50, 1 << 1               # read by the boot ROM; RCM: enter USB recovery (APX)
+PMC_RST_STATUS = 0x1b4                                      # reset reason, supplied by the harness
+L2C_BASE = 0x50043000           # PL310 (L2C-310) L2 cache controller
+L2C_READONLY = {0x000: 0x410000c7, 0x004: 0x1c400400}  # CACHE_ID, CACHE_TYPE, as read on a Surface RT
+L2C_MAINT = {0x730, 0x77c, 0x7bc, 0x7fc}   # CACHE_SYNC, INV_WAY, CLEAN_WAY, CLEAN_INV_WAY: done at once, read 0
 CAR_BASE = 0x60006000
 PLL_LOCK = 1 << 27          # LOCK bit in each CAR PLL*_BASE register
 PLL_BASES = {CAR_BASE + off for off in range(0x80, 0x100, 0x10)}            # PLLC/M/P/A/U/D/X base registers
@@ -104,6 +109,9 @@ class Tegra:
         self.pmc = {}                   # PMC byte offset -> value (e.g. reset status); default 0
         self.mem = dict(RESET_STANDINS) # MMIO word store: last value written, read back by default
         self.unmodelled = {}            # ('r'/'w', word address) -> [count, first pc] of accesses the store served
+        self.log_ranges = []            # (start, end) address ranges whose MMIO accesses go to access_log
+        self.access_log = []            # [phase index, core, pc, 'r'/'w', address, size, value, model, repeats], in
+                                        # order; consecutive identical accesses share one entry
         self.fault = None               # (kind, address) if the run stopped on a memory fault
         self.halted = False             # set when the AVP halts itself at the FLOW controller
         self.reset = None               # PMC_SCRATCH0 at the moment the code requested a system reset (MAIN_RST)
@@ -143,36 +151,65 @@ class Tegra:
         self._trace = trace
 
     # -- peripheral model -------------------------------------------------
+    # Each access is served by a model ('sdhci', 'uart', 'flow', 'pmc', 'pll', 'l2c', 'timer', 'id') or the 'store',
+    # which has none: a read returns what was last written there.
     def _mmio_read(self, uc, offset, size, _):
         addr = MMIO_BASE + offset
-        if SDMMC4_BASE <= addr < SDMMC4_BASE + SDMMC4_SIZE:
-            return self.sdhci.read(addr - SDMMC4_BASE, size)
-        if addr == PG_UP_TAG:
-            return 0xaaaaaaaa if self.is_avp else 0x55555555
-        if addr == APB_GP_HIDREV:
-            return 0x3000               # chip id 0x30 (Tegra30), revision fields zero
-        if addr == TMRUS:
-            self.us += 1
-            return self.us & 0xffffffff
-        if PMC_BASE <= addr < PMC_BASE + 0x400:
-            return self.pmc.get(addr - PMC_BASE, 0)
-        if addr in UART_LSR:                # TX holding + shift empty, so transmit loops exit
-            return 0x60
-        val = self.mem.get(addr & ~3, 0)
-        if (addr & ~3) in PLL_BASES:        # report the PLL as locked so clock init proceeds
-            return val | PLL_LOCK
-        self._note_unmodelled('r', addr)
-        return val
+        value, model = self._read(addr, size)
+        self._account('r', addr, size, value, model)
+        return value
 
     def _mmio_write(self, uc, offset, size, value, _):
         addr = MMIO_BASE + offset
+        self._account('w', addr, size, value & 0xffffffff, self._write(uc, addr, size, value))
+
+    def _account(self, kind, addr, size, value, model):
+        if model == 'store':
+            self._note_unmodelled(kind, addr)
+        if any(lo <= addr < hi for lo, hi in self.log_ranges):
+            entry = [len(self.phases), 'AVP' if self.is_avp else 'A9', self.uc.reg_read(UC_ARM_REG_PC), kind, addr,
+                     size, value, model, 1]
+            last = self.access_log[-1] if self.access_log else None
+            if last and last[:-1] == entry[:-1]:      # a polling loop: count it instead of growing the log
+                last[-1] += 1
+            else:
+                self.access_log.append(entry)
+
+    def _read(self, addr, size):
+        """One MMIO read -> (value, model)."""
         if SDMMC4_BASE <= addr < SDMMC4_BASE + SDMMC4_SIZE:
-            return self.sdhci.write(addr - SDMMC4_BASE, size, value)
+            return self.sdhci.read(addr - SDMMC4_BASE, size), 'sdhci'
+        if addr == PG_UP_TAG:
+            return (0xaaaaaaaa if self.is_avp else 0x55555555), 'id'
+        if addr == APB_GP_HIDREV:
+            return 0x3000, 'id'         # chip id 0x30 (Tegra30), revision fields zero
+        if addr == TMRUS:
+            self.us += 1
+            return self.us & 0xffffffff, 'timer'
+        if PMC_BASE <= addr < PMC_BASE + 0x400:
+            off = addr - PMC_BASE
+            return self.pmc.get(off, 0), ('pmc' if off in (PMC_PWRGATE_STATUS, PMC_RST_STATUS) else 'store')
+        if addr in UART_LSR:                # TX holding + shift empty, so transmit loops exit
+            return 0x60, 'uart'
+        if addr - L2C_BASE in L2C_READONLY:
+            return L2C_READONLY[addr - L2C_BASE], 'l2c'
+        if addr - L2C_BASE in L2C_MAINT:
+            return 0, 'l2c'
+        val = self.mem.get(addr & ~3, 0)
+        if (addr & ~3) in PLL_BASES:        # report the PLL as locked so clock init proceeds
+            return val | PLL_LOCK, 'pll'
+        return val, 'store'
+
+    def _write(self, uc, addr, size, value):
+        """Apply one MMIO write -> the model that took it."""
+        if SDMMC4_BASE <= addr < SDMMC4_BASE + SDMMC4_SIZE:
+            self.sdhci.write(addr - SDMMC4_BASE, size, value)
+            return 'sdhci'
         if addr in UART_THR and size == 1:
             self.console.append(value & 0xff)
             if self.uart_sink:
                 self.uart_sink(value & 0xff)
-            return
+            return 'uart'
         if addr == FLOW_HALT_COP:
             self.mem[addr & ~3] = value & 0xffffffff
             if self.is_avp and value & FLOW_MODE_STOP and self.mem.get(EVP_CPU_RESET):
@@ -182,21 +219,23 @@ class Tegra:
             elif not self.is_avp and not value & FLOW_MODE_STOP and self.mem.get(EVP_COP_RESET):
                 self.start_avp = True                        # the A9 released the AVP (FLOW_MODE_NONE) to restart
                 uc.emu_stop()
-            return
+            return 'flow'
         if PMC_BASE <= addr < PMC_BASE + 0x400:
             off = addr - PMC_BASE
             if off == PMC_CNTRL and value & PMC_CNTRL_MAIN_RST:
                 self.reset = self.pmc.get(PMC_SCRATCH0, 0)
                 uc.emu_stop()
-                return
+                return 'pmc'
+            model = 'store'
             if off == PMC_PWRGATE_TOGGLE and value & 0x100:        # START: flip the partition's status bit
                 self.pmc[PMC_PWRGATE_STATUS] = self.pmc.get(PMC_PWRGATE_STATUS, 0) ^ (1 << (value & 0x1f))
+                model = 'pmc'
             self.pmc[off] = value & 0xffffffff
-            return
-        if (addr & ~3) not in PLL_BASES:
-            self._note_unmodelled('w', addr)
+            return model
+        if addr - L2C_BASE in L2C_READONLY or addr - L2C_BASE in L2C_MAINT:
+            return 'l2c'
         self.mem[addr & ~3] = value & 0xffffffff
-        return
+        return 'pll' if (addr & ~3) in PLL_BASES else 'store'
 
     def _note_unmodelled(self, kind, addr):
         n = self.unmodelled.get((kind, addr & ~3))
