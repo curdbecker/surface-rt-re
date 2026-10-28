@@ -1,3 +1,8 @@
 [submodule "u-boot"]
 	path = u-boot
 	url = https://git.u-boot-project.org/u-boot/u-boot.git
+	ignore = dirty
+[submodule "fusee-tools"]
+	path = fusee-tools
+	url = https://codeberg.org/libre-tegra/fusee-tools.git
+	ignore = dirty

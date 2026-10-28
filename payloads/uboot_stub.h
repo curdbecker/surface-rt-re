@@ -1,6 +1,7 @@
 /*
- * The design-C loader stub's contract (uboot_stub.S): where it sits on the eMMC and where it expects U-Boot. The
- * installer (uboot_emmc.py) reads this header and writes to match, checking it against the NVDAUEFI table.
+ * The design-C loader stub's contract (uboot_stub.S): where it sits on the eMMC, where it expects U-Boot, and the
+ * launch marker it leaves for U-Boot. The installer (srt_uboot.py) reads this header and writes to match, checking
+ * it against the NVDAUEFI table; U-Boot's board code (board/microsoft/surface-rt/surface-rt.c) includes it.
  */
 #ifndef UBOOT_STUB_H
 #define UBOOT_STUB_H
@@ -15,6 +16,12 @@
 #define UBOOT_DEVICE    NVDAUEFI_DEVICE_BOOT0
 #define UBOOT_OFFSET    0x50000
 #define UBOOT_SIZE      0x1a0000
+
+/* Launch-path marker: the stub writes LAUNCH_MAGIC to LAUNCH_MARKER on the eMMC cold-boot path; U-Boot's board
+ * code reads and clears it (absent, i.e. RAM-loaded over APX -> fastboot). PMC_SCRATCH43 is in the always-on
+ * domain, survives the warm resets of the hand-off, and is outside the scratch1..23 that SPL clears. */
+#define LAUNCH_MARKER   0x7000e62c
+#define LAUNCH_MAGIC    0x5e7b0001
 
 /* The AVP (not the A9) starts U-Boot, at the SPL load address: CONFIG_SPL_TEXT_BASE, with U-Boot proper packed at
  * CONFIG_TEXT_BASE inside the same image. SPL then brings the clocks up and resets the A9 cleanly (spl.c). */

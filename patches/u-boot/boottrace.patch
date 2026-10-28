@@ -1,0 +1,271 @@
+Boot-trace instrumentation for U-Boot (test/diagnostic, not for a shipping build).
+
+With it, a U-Boot that boots without a usable console records how far it got: numbered checkpoints along
+board_init_f / board_init_r (and inside console_init_r), a [probe <dev>]/[/<dev>] and [start <dev>]/[started]
+marker around each driver-model probe and console-device start, and a copy of the console. The trace stub
+(payloads/uboot_stub-boottrace.bin) sets the storage up before handing over; the device reads it back in disk
+mode with diskmode/srt-boottrace. The storage layout is payloads/boottrace.h.
+
+The in-tree header (arch/arm/include/asm/arch-tegra/boottrace.h) only emits code when BOOTTRACE_PROGRESS is
+defined; that, and the other addresses, come from payloads/boottrace.h force-included at build time, so the
+whole thing compiles to nothing unless the build asks for it. The build, the trace run and the checkpoint map:
+README.md, Debugging U-Boot without a console.
+
+diff --git a/arch/arm/include/asm/arch-tegra/boottrace.h b/arch/arm/include/asm/arch-tegra/boottrace.h
+new file mode 100644
+index 00000000000..c737e2ebe81
+--- /dev/null
++++ b/arch/arm/include/asm/arch-tegra/boottrace.h
+@@ -0,0 +1,43 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Boot trace (test instrumentation): built with KCFLAGS="-include <surface-rt-re>/boottrace.h", boottrace(n) records
++ * checkpoint n in a PMC scratch register and the console is copied into a log in DRAM, both read back after the
++ * run. Without that header, everything here compiles to nothing.
++ */
++#ifndef _TEGRA_BOOTTRACE_H
++#define _TEGRA_BOOTTRACE_H
++
++#ifdef BOOTTRACE_PROGRESS
++#include <cpu_func.h>
++#include <asm/io.h>
++
++#define boottrace(n)	writel(BOOTTRACE_MAGIC + (n), BOOTTRACE_PROGRESS)
++
++/* Appends to the log the trace stub started; each line written goes out to DRAM before the watchdog reset */
++static inline void boottrace_putc(char c)
++{
++	u32 *log = (u32 *)BOOTTRACE_LOG;
++	ulong at, line;
++
++	if (log[0] != BOOTTRACE_LOG_MAGIC || log[1] >= BOOTTRACE_LOG_SIZE - 8)
++		return;
++	at = BOOTTRACE_LOG + 8 + log[1];
++	*(char *)at = c;
++	log[1]++;
++	line = at & ~(ulong)(CONFIG_SYS_CACHELINE_SIZE - 1);
++	flush_dcache_range(line, line + CONFIG_SYS_CACHELINE_SIZE);
++	flush_dcache_range(BOOTTRACE_LOG, BOOTTRACE_LOG + CONFIG_SYS_CACHELINE_SIZE);
++}
++
++static inline void boottrace_puts(const char *s)
++{
++	while (*s)
++		boottrace_putc(*s++);
++}
++#else
++#define boottrace(n)		do { } while (0)
++#define boottrace_putc(c)	do { } while (0)
++#define boottrace_puts(s)	do { } while (0)
++#endif
++
++#endif /* _TEGRA_BOOTTRACE_H */
+diff --git a/common/board_f.c b/common/board_f.c
+index ead7b6dd743..7cb2f9c62f1 100644
+--- a/common/board_f.c
++++ b/common/board_f.c
+@@ -38,6 +38,7 @@
+ #include <serial.h>
+ #include <spl.h>
+ #include <sysreset.h>
++#include <asm/arch-tegra/boottrace.h>
+ #include <time.h>
+ #include <timer.h>
+ #include <trace.h>
+@@ -922,6 +923,7 @@ static void initcall_run_f(void)
+ 	 * Please do not add logic to this function (variables, if (), etc.).
+ 	 * For simplicity it should remain an ordered list of function calls.
+ 	 */
++	boottrace(4);
+ 	INITCALL(setup_mon_len);
+ 	INITCALL(initf_malloc);
+ #if CONFIG_IS_ENABLED(OF_CONTROL)
+@@ -942,9 +944,11 @@ static void initcall_run_f(void)
+ 	INITCALL(console_record_init);
+ #endif
+ 	INITCALL_EVT(EVT_FSP_INIT_F);
++	boottrace(5);
+ 	INITCALL(arch_cpu_init);	/* basic arch cpu dependent setup */
+ 	INITCALL(mach_cpu_init);	/* SoC/machine dependent CPU setup */
+ 	INITCALL(initf_dm);
++	boottrace(6);
+ #if CONFIG_IS_ENABLED(BOARD_EARLY_INIT_F)
+ 	INITCALL(board_early_init_f);
+ #endif
+@@ -958,10 +962,12 @@ static void initcall_run_f(void)
+ #if CONFIG_IS_ENABLED(BOARD_POSTCLK_INIT)
+ 	INITCALL(board_postclk_init);
+ #endif
++	boottrace(7);
+ 	INITCALL(env_init);		/* initialize environment */
+ 	INITCALL(init_baud_rate);	/* initialze baudrate settings */
+ 	INITCALL(serial_init);		/* serial communications setup */
+ 	INITCALL(console_init_f);	/* stage 1 init of console */
++	boottrace(8);
+ 	INITCALL(display_options);	/* say that we are here */
+ 	INITCALL(display_text_info);	/* show debugging info if required */
+ 	INITCALL(checkcpu);
+@@ -986,6 +992,7 @@ static void initcall_run_f(void)
+ #endif
+ 	INITCALL(announce_dram_init);
+ 	INITCALL(dram_init);		/* configure available RAM banks */
++	boottrace(9);
+ #if CONFIG_IS_ENABLED(POST)
+ 	INITCALL(post_init_f);
+ #endif
+diff --git a/common/board_r.c b/common/board_r.c
+index a397e20959d..e0dfd5a32b6 100644
+--- a/common/board_r.c
++++ b/common/board_r.c
+@@ -65,6 +65,7 @@
+ #include <wdt.h>
+ #include <asm-generic/gpio.h>
+ #include <relocate.h>
++#include <asm/arch-tegra/boottrace.h>
+ 
+ DECLARE_GLOBAL_DATA_PTR;
+ 
+@@ -598,6 +599,7 @@ static void initcall_run_r(void)
+ 	 * Please do not add logic to this function (variables, if (), etc.).
+ 	 * For simplicity it should remain an ordered list of function calls.
+ 	 */
++	boottrace(10);
+ 	INITCALL(initr_trace);
+ 	INITCALL(initr_reloc);
+ 	INITCALL(event_init);
+@@ -628,6 +630,7 @@ static void initcall_run_r(void)
+ 	INITCALL(initr_of_live);
+ #if CONFIG_IS_ENABLED(DM)
+ 	INITCALL(initr_dm);
++	boottrace(11);
+ #endif
+ #if CONFIG_IS_ENABLED(ADDR_MAP)
+ 	INITCALL(init_addr_map);
+@@ -702,6 +705,7 @@ static void initcall_run_r(void)
+ #endif
+ #if CONFIG_IS_ENABLED(MMC)
+ 	INITCALL(initr_mmc);
++	boottrace(12);
+ #endif
+ #if CONFIG_IS_ENABLED(XEN)
+ 	INITCALL(xen_init);
+@@ -710,6 +714,7 @@ static void initcall_run_r(void)
+ 	INITCALL(initr_pvblock);
+ #endif
+ 	INITCALL(initr_env);
++	boottrace(13);
+ #if CONFIG_IS_ENABLED(SYS_MALLOC_BOOTPARAMS)
+ 	INITCALL(initr_malloc_bootparams);
+ #endif
+@@ -727,6 +732,7 @@ static void initcall_run_r(void)
+ 	INITCALL(pci_init);
+ #endif
+ 	INITCALL(stdio_add_devices);
++	boottrace(14);
+ 	INITCALL(jumptable_init);
+ #if CONFIG_IS_ENABLED(API)
+ 	INITCALL(api_init);
+@@ -773,6 +779,7 @@ static void initcall_run_r(void)
+ 	INITCALL(initr_mem);
+ #endif
+ 	INITCALL(initr_boot_led_on);
++	boottrace(15);
+ 	INITCALL(run_main_loop);
+ }
+ 
+diff --git a/common/console.c b/common/console.c
+index 54d1249422d..54709e2e648 100644
+--- a/common/console.c
++++ b/common/console.c
+@@ -7,6 +7,7 @@
+ #define LOG_CATEGORY	LOGC_CONSOLE
+ 
+ #include <console.h>
++#include <asm/arch-tegra/boottrace.h>
+ #include <debug_uart.h>
+ #include <display_options.h>
+ #include <dm.h>
+@@ -481,7 +482,11 @@ int console_start(int file, struct stdio_dev *sdev)
+ 
+ 	/* Start new device */
+ 	if (sdev->start) {
++		boottrace_puts("[start ");
++		boottrace_puts(sdev->name);
++		boottrace_puts("]");
+ 		error = sdev->start(sdev);
++		boottrace_puts("[started]");
+ 		/* If it's not started don't use it */
+ 		if (error < 0)
+ 			return error;
+@@ -723,6 +728,7 @@ void putc(const char c)
+ 		return;
+ 
+ 	console_record_putc(c);
++	boottrace_putc(c);
+ 
+ 	/* sandbox can send characters to stdout before it has a console */
+ 	if (IS_ENABLED(CONFIG_SANDBOX) && !(gd->flags & GD_FLG_SERIAL_READY)) {
+@@ -764,6 +770,7 @@ void puts(const char *s)
+ 		return;
+ 
+ 	console_record_puts(s);
++	boottrace_puts(s);
+ 
+ 	/* sandbox can send characters to stdout before it has a console */
+ 	if (IS_ENABLED(CONFIG_SANDBOX) && !(gd->flags & GD_FLG_SERIAL_READY)) {
+@@ -1138,9 +1145,13 @@ int console_init_r(void)
+ 		outputdev = console_search_dev(DEV_FLAGS_OUTPUT, stdoutname);
+ 		errdev    = console_search_dev(DEV_FLAGS_OUTPUT, stderrname);
+ 		if (CONFIG_IS_ENABLED(CONSOLE_MUX)) {
++			boottrace(16);
+ 			iomux_err = iomux_doenv(stdin, stdinname);
++			boottrace(17);
+ 			iomux_err += iomux_doenv(stdout, stdoutname);
++			boottrace(18);
+ 			iomux_err += iomux_doenv(stderr, stderrname);
++			boottrace(19);
+ 			if (!iomux_err)
+ 				/* Successful, so skip all the code below. */
+ 				goto done;
+diff --git a/drivers/core/device.c b/drivers/core/device.c
+index 6024534ff93..e70295a1523 100644
+--- a/drivers/core/device.c
++++ b/drivers/core/device.c
+@@ -34,6 +34,7 @@
+ #include <linux/list.h>
+ #include <power-domain.h>
+ #include <linux/printk.h>
++#include <asm/arch-tegra/boottrace.h>
+ 
+ DECLARE_GLOBAL_DATA_PTR;
+ 
+@@ -521,6 +522,9 @@ int device_probe(struct udevice *dev)
+ 	}
+ 
+ 	dev_or_flags(dev, DM_FLAG_ACTIVATED);
++	boottrace_puts("[probe ");
++	boottrace_puts(dev->name);
++	boottrace_puts("]");
+ 
+ 	if (CONFIG_IS_ENABLED(POWER_DOMAIN) && dev->parent &&
+ 	    (device_get_uclass_id(dev) != UCLASS_POWER_DOMAIN) &&
+@@ -605,6 +609,9 @@ int device_probe(struct udevice *dev)
+ 	if (ret)
+ 		goto fail_event;
+ 
++	boottrace_puts("[/");
++	boottrace_puts(dev->name);
++	boottrace_puts("]");
+ 	return 0;
+ fail_event:
+ fail_uclass:
+@@ -613,6 +620,9 @@ fail_uclass:
+ 			__func__, dev->name);
+ 	}
+ fail:
++	boottrace_puts("[fail ");
++	boottrace_puts(dev->name);
++	boottrace_puts("]");
+ 	dev_bic_flags(dev, DM_FLAG_ACTIVATED);
+ 
+ 	device_free(dev);

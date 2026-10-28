@@ -1,0 +1,334 @@
+From 47c8693b0c5393b0bc317f6e9750ccaa6b66df54 Mon Sep 17 00:00:00 2001
+From: Curd Becker <me@curd-becker.de>
+Date: Tue, 27 Oct 2026 16:53:30 +0000
+Subject: [PATCH 3/5] input: factor HID keyboard report handling out of
+ apple_spi_kbd
+
+Turning a boot-keyboard-style report (modifier bits for usages E0-E7 and
+an array of Keyboard/Keypad usages) into key events is not specific to
+the Apple SPI keyboard. Move the usage table and the old/new report
+comparison into hid_kbd.c (CONFIG_HID_KBD, selected by the drivers that
+use it), so that other HID keyboard drivers share them instead of
+carrying their own copies.
+
+No functional change: the table is unchanged, and the events are the
+same and in the same order (modifiers in the driver's order, then per
+key slot the released key before the pressed one).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/input/Kconfig         |   7 +++
+ drivers/input/Makefile        |   1 +
+ drivers/input/apple_spi_kbd.c | 104 ++--------------------------------
+ drivers/input/hid_kbd.c       |  79 ++++++++++++++++++++++++++
+ include/hid_kbd.h             |  31 ++++++++++
+ 5 files changed, 123 insertions(+), 99 deletions(-)
+ create mode 100644 drivers/input/hid_kbd.c
+ create mode 100644 include/hid_kbd.h
+
+diff --git a/drivers/input/Kconfig b/drivers/input/Kconfig
+index df8fbf1551d..997b230cf08 100644
+--- a/drivers/input/Kconfig
++++ b/drivers/input/Kconfig
+@@ -38,9 +38,16 @@ config TPL_DM_KEYBOARD
+ 	  includes methods to start/stop the device, check for available
+ 	  input and update LEDs if the keyboard has them.
+ 
++config HID_KBD
++	bool
++	help
++	  Key events from HID keyboard reports (modifier bits and key
++	  usages), shared by the drivers of HID keyboards.
++
+ config APPLE_SPI_KEYB
+ 	bool "Enable Apple SPI keyboard support"
+ 	depends on DM_KEYBOARD && DM_SPI
++	select HID_KBD
+ 	help
+ 	  This adds a driver for the keyboards found on various
+ 	  laptops based on Apple SoCs. These keyboards use an
+diff --git a/drivers/input/Makefile b/drivers/input/Makefile
+index 1303fcdb0b7..674f53b3c27 100644
+--- a/drivers/input/Makefile
++++ b/drivers/input/Makefile
+@@ -12,6 +12,7 @@ obj-$(CONFIG_CPCAP_POWER_BUTTON) += cpcap_pwrbutton.o
+ ifndef CONFIG_XPL_BUILD
+ 
+ obj-$(CONFIG_APPLE_SPI_KEYB) += apple_spi_kbd.o
++obj-$(CONFIG_HID_KBD) += hid_kbd.o
+ obj-$(CONFIG_I8042_KEYB) += i8042.o
+ obj-$(CONFIG_TEGRA_KEYBOARD) += input.o tegra-kbc.o
+ obj-$(CONFIG_TWL4030_INPUT) += twl4030.o
+diff --git a/drivers/input/apple_spi_kbd.c b/drivers/input/apple_spi_kbd.c
+index 5b30cec2dcb..acb03c6edbe 100644
+--- a/drivers/input/apple_spi_kbd.c
++++ b/drivers/input/apple_spi_kbd.c
+@@ -4,12 +4,12 @@
+  */
+ 
+ #include <dm.h>
++#include <hid_kbd.h>
+ #include <keyboard.h>
+ #include <spi.h>
+ #include <stdio_dev.h>
+ #include <asm-generic/gpio.h>
+ #include <linux/delay.h>
+-#include <linux/input.h>
+ 
+ /*
+  * The Apple SPI keyboard controller implements a protocol that
+@@ -17,45 +17,6 @@
+  * mapped according to the HID Keyboard/Keypad Usage Table.
+  */
+ 
+-/* Modifier key bits */
+-#define HID_MOD_LEFTCTRL	BIT(0)
+-#define HID_MOD_LEFTSHIFT	BIT(1)
+-#define HID_MOD_LEFTALT		BIT(2)
+-#define HID_MOD_LEFTGUI		BIT(3)
+-#define HID_MOD_RIGHTCTRL	BIT(4)
+-#define HID_MOD_RIGHTSHIFT	BIT(5)
+-#define HID_MOD_RIGHTALT	BIT(6)
+-#define HID_MOD_RIGHTGUI	BIT(7)
+-
+-static const u8 hid_kbd_keymap[] = {
+-	KEY_RESERVED, 0xff, 0xff, 0xff,
+-	KEY_A, KEY_B, KEY_C, KEY_D,
+-	KEY_E, KEY_F, KEY_G, KEY_H,
+-	KEY_I, KEY_J, KEY_K, KEY_L,
+-	KEY_M, KEY_N, KEY_O, KEY_P,
+-	KEY_Q, KEY_R, KEY_S, KEY_T,
+-	KEY_U, KEY_V, KEY_W, KEY_X,
+-	KEY_Y, KEY_Z, KEY_1, KEY_2,
+-	KEY_3, KEY_4, KEY_5, KEY_6,
+-	KEY_7, KEY_8, KEY_9, KEY_0,
+-	KEY_ENTER, KEY_ESC, KEY_BACKSPACE, KEY_TAB,
+-	KEY_SPACE, KEY_MINUS, KEY_EQUAL, KEY_LEFTBRACE,
+-	KEY_RIGHTBRACE, KEY_BACKSLASH, 0xff, KEY_SEMICOLON,
+-	KEY_APOSTROPHE, KEY_GRAVE, KEY_COMMA, KEY_DOT,
+-	KEY_SLASH, KEY_CAPSLOCK, KEY_F1, KEY_F2,
+-	KEY_F3, KEY_F4, KEY_F5, KEY_F6,
+-	KEY_F7, KEY_F8, KEY_F9, KEY_F10,
+-	KEY_F11, KEY_F12, KEY_SYSRQ, KEY_SCROLLLOCK,
+-	KEY_PAUSE, KEY_INSERT, KEY_HOME, KEY_PAGEUP,
+-	KEY_DELETE, KEY_END, KEY_PAGEDOWN, KEY_RIGHT,
+-	KEY_LEFT, KEY_DOWN, KEY_UP, KEY_NUMLOCK,
+-	KEY_KPSLASH, KEY_KPASTERISK, KEY_KPMINUS, KEY_KPPLUS,
+-	KEY_KPENTER, KEY_KP1, KEY_KP2, KEY_KP3,
+-	KEY_KP4, KEY_KP5, KEY_KP6, KEY_KP7,
+-	KEY_KP8, KEY_KP9, KEY_KP0, KEY_KPDOT,
+-	KEY_BACKSLASH, KEY_COMPOSE, KEY_POWER, KEY_KPEQUAL,
+-};
+-
+ /* Report ID used for keyboard input reports. */
+ #define KBD_REPORTID	0x01
+ 
+@@ -100,59 +61,6 @@ struct apple_spi_kbd_msg {
+ 	u8 data[0];
+ };
+ 
+-static void apple_spi_kbd_service_modifiers(struct input_config *input)
+-{
+-	struct apple_spi_kbd_priv *priv = dev_get_priv(input->dev);
+-	u8 new = priv->new.modifiers;
+-	u8 old = priv->old.modifiers;
+-
+-	if ((new ^ old) & HID_MOD_LEFTCTRL)
+-		input_add_keycode(input, KEY_LEFTCTRL,
+-				  old & HID_MOD_LEFTCTRL);
+-	if ((new ^ old) & HID_MOD_RIGHTCTRL)
+-		input_add_keycode(input, KEY_RIGHTCTRL,
+-				  old & HID_MOD_RIGHTCTRL);
+-	if ((new ^ old) & HID_MOD_LEFTSHIFT)
+-		input_add_keycode(input, KEY_LEFTSHIFT,
+-				  old & HID_MOD_LEFTSHIFT);
+-	if ((new ^ old) & HID_MOD_RIGHTSHIFT)
+-		input_add_keycode(input, KEY_RIGHTSHIFT,
+-				  old & HID_MOD_RIGHTSHIFT);
+-	if ((new ^ old) & HID_MOD_LEFTALT)
+-		input_add_keycode(input, KEY_LEFTALT,
+-				  old & HID_MOD_LEFTALT);
+-	if ((new ^ old) & HID_MOD_RIGHTALT)
+-		input_add_keycode(input, KEY_RIGHTALT,
+-				  old & HID_MOD_RIGHTALT);
+-	if ((new ^ old) & HID_MOD_LEFTGUI)
+-		input_add_keycode(input, KEY_LEFTMETA,
+-				  old & HID_MOD_LEFTGUI);
+-	if ((new ^ old) & HID_MOD_RIGHTGUI)
+-		input_add_keycode(input, KEY_RIGHTMETA,
+-				  old & HID_MOD_RIGHTGUI);
+-}
+-
+-static void apple_spi_kbd_service_key(struct input_config *input, int i,
+-				      int released)
+-{
+-	struct apple_spi_kbd_priv *priv = dev_get_priv(input->dev);
+-	u8 *new;
+-	u8 *old;
+-
+-	if (released) {
+-		new = priv->new.keycode;
+-		old = priv->old.keycode;
+-	} else {
+-		new = priv->old.keycode;
+-		old = priv->new.keycode;
+-	}
+-
+-	if (memscan(new, old[i], sizeof(priv->new.keycode)) ==
+-	    new + sizeof(priv->new.keycode) &&
+-	    old[i] < ARRAY_SIZE(hid_kbd_keymap))
+-		input_add_keycode(input, hid_kbd_keymap[old[i]], released);
+-}
+-
+ static int apple_spi_kbd_check(struct input_config *input)
+ {
+ 	struct udevice *dev = input->dev;
+@@ -160,7 +68,7 @@ static int apple_spi_kbd_check(struct input_config *input)
+ 	struct apple_spi_kbd_packet packet;
+ 	struct apple_spi_kbd_msg *msg;
+ 	struct apple_spi_kbd_report *report;
+-	int i, ret;
++	int ret;
+ 
+ 	memset(&packet, 0, sizeof(packet));
+ 
+@@ -200,11 +108,9 @@ static int apple_spi_kbd_check(struct input_config *input)
+ 	    report->reportid == KBD_REPORTID) {
+ 		memcpy(&priv->new, report,
+ 		       sizeof(struct apple_spi_kbd_report));
+-		apple_spi_kbd_service_modifiers(input);
+-		for (i = 0; i < sizeof(priv->new.keycode); i++) {
+-			apple_spi_kbd_service_key(input, i, 1);
+-			apple_spi_kbd_service_key(input, i, 0);
+-		}
++		hid_kbd_update(input, priv->old.modifiers, priv->old.keycode,
++			       priv->new.modifiers, priv->new.keycode,
++			       sizeof(priv->new.keycode));
+ 		memcpy(&priv->old, &priv->new,
+ 		       sizeof(struct apple_spi_kbd_report));
+ 		return 1;
+diff --git a/drivers/input/hid_kbd.c b/drivers/input/hid_kbd.c
+new file mode 100644
+index 00000000000..bd937eb6307
+--- /dev/null
++++ b/drivers/input/hid_kbd.c
+@@ -0,0 +1,79 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Key events from HID keyboard reports
++ */
++
++#include <hid_kbd.h>
++#include <input.h>
++#include <linux/input.h>
++#include <linux/kernel.h>
++#include <linux/string.h>
++
++/* Keyboard/Keypad usage to key code */
++static const u8 hid_kbd_keymap[] = {
++	KEY_RESERVED, 0xff, 0xff, 0xff,
++	KEY_A, KEY_B, KEY_C, KEY_D,
++	KEY_E, KEY_F, KEY_G, KEY_H,
++	KEY_I, KEY_J, KEY_K, KEY_L,
++	KEY_M, KEY_N, KEY_O, KEY_P,
++	KEY_Q, KEY_R, KEY_S, KEY_T,
++	KEY_U, KEY_V, KEY_W, KEY_X,
++	KEY_Y, KEY_Z, KEY_1, KEY_2,
++	KEY_3, KEY_4, KEY_5, KEY_6,
++	KEY_7, KEY_8, KEY_9, KEY_0,
++	KEY_ENTER, KEY_ESC, KEY_BACKSPACE, KEY_TAB,
++	KEY_SPACE, KEY_MINUS, KEY_EQUAL, KEY_LEFTBRACE,
++	KEY_RIGHTBRACE, KEY_BACKSLASH, 0xff, KEY_SEMICOLON,
++	KEY_APOSTROPHE, KEY_GRAVE, KEY_COMMA, KEY_DOT,
++	KEY_SLASH, KEY_CAPSLOCK, KEY_F1, KEY_F2,
++	KEY_F3, KEY_F4, KEY_F5, KEY_F6,
++	KEY_F7, KEY_F8, KEY_F9, KEY_F10,
++	KEY_F11, KEY_F12, KEY_SYSRQ, KEY_SCROLLLOCK,
++	KEY_PAUSE, KEY_INSERT, KEY_HOME, KEY_PAGEUP,
++	KEY_DELETE, KEY_END, KEY_PAGEDOWN, KEY_RIGHT,
++	KEY_LEFT, KEY_DOWN, KEY_UP, KEY_NUMLOCK,
++	KEY_KPSLASH, KEY_KPASTERISK, KEY_KPMINUS, KEY_KPPLUS,
++	KEY_KPENTER, KEY_KP1, KEY_KP2, KEY_KP3,
++	KEY_KP4, KEY_KP5, KEY_KP6, KEY_KP7,
++	KEY_KP8, KEY_KP9, KEY_KP0, KEY_KPDOT,
++	KEY_BACKSLASH, KEY_COMPOSE, KEY_POWER, KEY_KPEQUAL,
++};
++
++/* Modifier bits (usages E0-E7) in the order their changes are reported */
++static const struct {
++	u8 bit;
++	u8 key;
++} hid_kbd_modmap[] = {
++	{ BIT(0), KEY_LEFTCTRL },
++	{ BIT(4), KEY_RIGHTCTRL },
++	{ BIT(1), KEY_LEFTSHIFT },
++	{ BIT(5), KEY_RIGHTSHIFT },
++	{ BIT(2), KEY_LEFTALT },
++	{ BIT(6), KEY_RIGHTALT },
++	{ BIT(3), KEY_LEFTMETA },
++	{ BIT(7), KEY_RIGHTMETA },
++};
++
++/* Report @keys[@i] as released or pressed if @others does not hold it */
++static void hid_kbd_key(struct input_config *input, const u8 *keys,
++			const u8 *others, uint i, uint nkeys, bool release)
++{
++	if (memscan((void *)others, keys[i], nkeys) == others + nkeys &&
++	    keys[i] < ARRAY_SIZE(hid_kbd_keymap))
++		input_add_keycode(input, hid_kbd_keymap[keys[i]], release);
++}
++
++void hid_kbd_update(struct input_config *input, u8 old_mods,
++		    const u8 *old_keys, u8 mods, const u8 *keys, uint nkeys)
++{
++	uint i;
++
++	for (i = 0; i < ARRAY_SIZE(hid_kbd_modmap); i++)
++		if ((mods ^ old_mods) & hid_kbd_modmap[i].bit)
++			input_add_keycode(input, hid_kbd_modmap[i].key,
++					  old_mods & hid_kbd_modmap[i].bit);
++	for (i = 0; i < nkeys; i++) {
++		hid_kbd_key(input, old_keys, keys, i, nkeys, true);
++		hid_kbd_key(input, keys, old_keys, i, nkeys, false);
++	}
++}
+diff --git a/include/hid_kbd.h b/include/hid_kbd.h
+new file mode 100644
+index 00000000000..1e8733de868
+--- /dev/null
++++ b/include/hid_kbd.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Key events from HID keyboard reports
++ */
++
++#ifndef __HID_KBD_H
++#define __HID_KBD_H
++
++#include <linux/types.h>
++
++struct input_config;
++
++/**
++ * hid_kbd_update() - report a change of HID keyboard state as key events
++ *
++ * The state is that of a boot keyboard report: the modifier bits (usages
++ * E0-E7) and an array of usages from the Keyboard/Keypad page. Modifier
++ * changes are reported first, then for each array slot its released key
++ * before its pressed one.
++ *
++ * @input:	input configuration to report to
++ * @old_mods:	previous modifier bits
++ * @old_keys:	previous key usages, @nkeys entries
++ * @mods:	current modifier bits
++ * @keys:	current key usages, @nkeys entries
++ * @nkeys:	number of entries in @old_keys and @keys
++ */
++void hid_kbd_update(struct input_config *input, u8 old_mods,
++		    const u8 *old_keys, u8 mods, const u8 *keys, uint nkeys);
++
++#endif
+-- 
+2.50.1
+

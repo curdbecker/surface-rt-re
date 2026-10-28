@@ -3,8 +3,8 @@
 # postmarketOS kernel (linux-postmarketos-grate), the plain (non-EFI) DTB, and a merged initramfs that drops
 # into the pmOS debug shell in "disk mode": the debug shell exposes the eMMC to the USB host as mass storage
 # (boot0/boot1 read-write, user area read-only) through pmOS's pmos.usb-storage= mechanism, extended to several
-# LUNs by 0001-initramfs-usb-storage-multiple-luns.patch. The host then runs ../uboot_emmc.py against those
-# LUNs to back up and install/remove U-Boot. See ../docs/boot-chain.md.
+# LUNs by 0001-initramfs-usb-storage-multiple-luns.patch. The host then runs ../srt_uboot.py against those
+# LUNs to back up and install/remove U-Boot. See ../README.md.
 #
 # The image carries no U-Boot, stub, installer or Python -- the host owns all of that; the initramfs only
 # exposes the disk. The console debug shell stays up alongside disk mode; 0002-initramfs-debug-shell-console.patch
@@ -15,7 +15,7 @@
 #
 # Requirements: root (chroot, mknod), curl, tar, openssl, python3, patch, fdtput (device-tree-compiler) and a
 # statically linked qemu-arm (e.g. qemu-arm-static from qemu-user-static). Host: Linux x86_64 or aarch64. To run
-# it without host root, run it as ../build.sh diskmode in the container of ../Dockerfile.
+# it without host root, run it as ../build.sh diskmode (in the container).
 #
 # Usage: build-pmos-surface-rt-diskmode.sh [output.img]
 # Env:   WORK (default ./pmos-surface-rt-build), QEMU_ARM (default: from PATH)
@@ -145,7 +145,7 @@ printf '/usr/lib/libkmod.so.2\n' > "$ROOT/etc/mkinitfs/files/50-udev-libkmod.fil
 
 # Boot-trace read-out (srt-boottrace): devmem2 and the layout it reads
 mkdir -p "$ROOT/usr/share/srt"
-cp "$SELF/../boottrace.h" "$SELF/../payloads/uboot_stub.h" "$ROOT/usr/share/srt/"
+cp "$SELF/../payloads/boottrace.h" "$SELF/../payloads/uboot_stub.h" "$ROOT/usr/share/srt/"
 install -m 755 "$SELF/srt-boottrace" "$ROOT/usr/bin/srt-boottrace"
 DEVMEM2=$(cd "$ROOT" && find usr/bin usr/sbin -name devmem2 | head -n 1)
 [ -n "$DEVMEM2" ] || { echo "error: devmem2 not installed" >&2; exit 1; }
@@ -215,8 +215,8 @@ echo "Patched $DTB: usb@7d000000 -> nvidia,tegra30-udc, peripheral-only, no VBUS
 # Device kernel command line without partition resizing, plus the debug shell in disk mode
 CMDLINE=$(cat "$ROOT"/usr/lib/kernel-cmdline.d/*"$DEVICE"*.conf |
 	grep -v -e '^#' -e '^pmos.force-partition-resize$' | tr '\n' ' ')
-# mem=: Linux stays below the boot-trace log (../boottrace.h), so srt-boottrace reads it intact
-TRACE_LOG=$(awk '$1 == "#define" && $2 == "BOOTTRACE_LOG" { print $3 }' "$SELF/../boottrace.h")
+# mem=: Linux stays below the boot-trace log (../payloads/boottrace.h), so srt-boottrace reads it intact
+TRACE_LOG=$(awk '$1 == "#define" && $2 == "BOOTTRACE_LOG" { print $3 }' "$SELF/../payloads/boottrace.h")
 CMDLINE="${CMDLINE}console=tty0 pmos.debug-shell pmos.usb-storage=$USB_STORAGE mem=$(( (TRACE_LOG - BASE) >> 20 ))M"
 
 PYTHONPATH="$TOOLS/gki" python3 "$TOOLS/mkbootimg.py" --header_version 0 \
@@ -230,4 +230,3 @@ PYTHONPATH="$TOOLS/gki" python3 "$TOOLS/mkbootimg.py" --header_version 0 \
 	-o "$OUT"
 echo "Wrote $OUT"
 echo "Command line: $CMDLINE"
-echo "Boot it with 'fastboot boot', then on the host: sudo .venv/bin/python uboot_emmc.py status"

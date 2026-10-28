@@ -1,0 +1,60 @@
+From 56569fc26841a11b00608ab4972e93f1d7bff0b7 Mon Sep 17 00:00:00 2001
+From: Curd Becker <me@curd-becker.de>
+Date: Mon, 26 Oct 2026 16:33:19 +0000
+Subject: [PATCH] main: send GET_PLATFORM_INFO before reading the BCT
+
+readbct sent NV3P_CMD_GET_BCT as the first nv3p command. The Tegra30
+nvflash v1.13 miniloader NACKs that with bad data (0x3). nvflash itself
+always sends GET_PLATFORM_INFO and waits for its status before any
+other command, so do the same for readbct: query and dump the platform
+info first, then read the BCT.
+
+Tested on a Tegra30 (Microsoft Surface RT) after fusee-gelee
+(patch_irom): readbct now succeeds with the built-in miniloader, and
+the BCT read back matches the device's.
+---
+ src/main.c | 21 +++++++++++----------
+ 1 file changed, 11 insertions(+), 10 deletions(-)
+
+diff --git a/src/main.c b/src/main.c
+index aeeb74d..4610d98 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -576,16 +576,6 @@ int main(int argc, char **argv)
+ 	if (ret)
+ 		err(1, "3p open failed");
+ 
+-	// read the BCT
+-	if (do_read) {
+-		printf("reading BCT from system, writing to %s...", bctfile);
+-		ret = read_bct(h3p, bctfile);
+-		if (ret)
+-			err(1, "error reading bct");
+-		printf("done!\n");
+-		exit(0);
+-	}
+-
+ 	// get platform info and dump it
+ 	ret = nv3p_cmd_send(h3p, NV3P_CMD_GET_PLATFORM_INFO, (uint8_t *)&info);
+ 	if (ret)
+@@ -596,6 +586,17 @@ int main(int argc, char **argv)
+ 	dump_platform_info(&info);
+ 	set_platform_info(&info);
+ 
++	// read the BCT; the miniloader NACKs GET_BCT (bad data) unless
++	// GET_PLATFORM_INFO came first, the same order nvflash uses
++	if (do_read) {
++		printf("reading BCT from system, writing to %s...", bctfile);
++		ret = read_bct(h3p, bctfile);
++		if (ret)
++			err(1, "error reading bct");
++		printf("done!\n");
++		exit(0);
++	}
++
+ 	if (info.op_mode != RCM_OP_MODE_DEVEL &&
+ 	    info.op_mode != RCM_OP_MODE_ODM_OPEN &&
+ 	    info.op_mode != RCM_OP_MODE_ODM_SECURE &&
+-- 
+2.43.0
+

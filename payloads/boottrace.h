@@ -1,7 +1,8 @@
 /*
- * Boot trace: how far a boot without a console got, read back in disk mode (docs/boot-chain.md). Shared by the
- * trace stub (payloads/uboot_stub.S), an instrumented U-Boot (KCFLAGS="-include boottrace.h") and the read-out
- * (diskmode/srt-boottrace). Plain integer #defines only: shell tools read them too.
+ * Boot trace: how far a boot without a console got, read back in disk mode (README.md). Shared by the
+ * trace stub (payloads/uboot_stub.S), an instrumented U-Boot (patches/u-boot/boottrace.patch, built with
+ * KCFLAGS="-include boottrace.h") and the read-out (diskmode/srt-boottrace). Plain integer #defines only: shell
+ * tools read them too.
  */
 #ifndef BOOTTRACE_H
 #define BOOTTRACE_H

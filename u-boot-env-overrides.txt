@@ -1,8 +1,0 @@
-# Changes to U-Boot's default environment (u-boot-initial-env of the u-boot submodule, surface-rt_defconfig).
-# build.sh u-boot applies them and writes the complete result to out/u-boot-env.txt, which uboot_emmc.py
-# installs to boot0. U-Boot replaces its built-in defaults with a stored environment instead of merging, so the
-# stored one has to be complete; it is regenerated whenever the submodule changes.
-# Syntax as for mkenvimage: one name=value per line, '#' at the start of a line for comments.
-
-# Boot the first bootflow found; if none boots, show the boot menu instead of stopping at the prompt.
-bootcmd=bootflow scan -lb; bootmenu

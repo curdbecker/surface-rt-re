@@ -1,0 +1,182 @@
+From 2433fd41935ed05e612b7feb8af50c453b75248a Mon Sep 17 00:00:00 2001
+From: Curd Becker <me@curd-becker.de>
+Date: Tue, 27 Oct 2026 16:31:36 +0000
+Subject: [PATCH 2/5] i2c: add a pass-through bus for GPIO-detected hot-plugged
+ devices
+
+The Microsoft Surface RT Type Cover sits on I2C1 behind a detect GPIO that
+is active while the cover is attached. The Linux device tree describes it
+with an "i2c-hotplug-gpio" node: a bus whose devices are its direct
+children, "i2c-parent" naming the bus that carries the transfers and
+"detect-gpios" the presence line.
+
+This driver implements that binding as a UCLASS_I2C bus. Transfers pass
+through to the parent bus while the detect GPIO has been active for 20 ms
+(the debounce time of the Linux driver of the same compatible) and fail
+with -ENODEV otherwise, without touching the parent bus. Drivers of the
+devices on the bus therefore see a detach as a transfer error and can
+re-initialise their device once transfers succeed again. U-Boot polls, so
+the detect GPIO is sampled on each transfer; the node's interrupt is not
+used.
+
+probe_chip is forwarded to the parent bus as well, because the uclass
+fallback probes with a zero-length message, which the Tegra controller
+cannot send.
+
+The I2C mux uclass is not used: it expects one subnode per channel, while
+this binding puts the devices directly under the bus node, so the mux
+uclass would bind each device as a channel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/i2c/Kconfig            |  10 ++++
+ drivers/i2c/Makefile           |   1 +
+ drivers/i2c/i2c-hotplug-gpio.c | 103 +++++++++++++++++++++++++++++++++
+ 3 files changed, 114 insertions(+)
+ create mode 100644 drivers/i2c/i2c-hotplug-gpio.c
+
+diff --git a/drivers/i2c/Kconfig b/drivers/i2c/Kconfig
+index 0b5225fd3f5..ad3fbaaff51 100644
+--- a/drivers/i2c/Kconfig
++++ b/drivers/i2c/Kconfig
+@@ -154,6 +154,16 @@ config SPL_DM_I2C_GPIO
+ 	  bindings are supported.
+ 	  Binding info: doc/device-tree-bindings/i2c/i2c-gpio.txt
+ 
++config I2C_HOTPLUG_GPIO
++	bool "I2C bus with GPIO-detected hot-plugged devices"
++	depends on DM_I2C && DM_GPIO
++	help
++	  Enable a pass-through I2C bus (compatible "i2c-hotplug-gpio") for
++	  devices that can be attached and detached at run time, such as the
++	  Microsoft Surface RT Type Cover. Transfers go to the parent bus
++	  named by "i2c-parent" while the "detect-gpios" GPIO is active and
++	  fail with -ENODEV otherwise.
++
+ config SYS_I2C_ADI
+ 	bool "ADI I2C driver"
+ 	depends on DM_I2C && ARCH_SC5XX
+diff --git a/drivers/i2c/Makefile b/drivers/i2c/Makefile
+index 79e6a298808..eeaf8f1511a 100644
+--- a/drivers/i2c/Makefile
++++ b/drivers/i2c/Makefile
+@@ -7,6 +7,7 @@ ifdef CONFIG_$(PHASE_)ACPIGEN
+ obj-$(CONFIG_$(PHASE_)DM_I2C) += acpi_i2c.o
+ endif
+ obj-$(CONFIG_$(PHASE_)DM_I2C_GPIO) += i2c-gpio.o
++obj-$(CONFIG_$(PHASE_)I2C_HOTPLUG_GPIO) += i2c-hotplug-gpio.o
+ obj-$(CONFIG_$(PHASE_)I2C_CROS_EC_TUNNEL) += cros_ec_tunnel.o
+ obj-$(CONFIG_$(PHASE_)I2C_CROS_EC_LDO) += cros_ec_ldo.o
+ 
+diff --git a/drivers/i2c/i2c-hotplug-gpio.c b/drivers/i2c/i2c-hotplug-gpio.c
+new file mode 100644
+index 00000000000..a141ebc610e
+--- /dev/null
++++ b/drivers/i2c/i2c-hotplug-gpio.c
+@@ -0,0 +1,103 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * I2C bus whose devices are hot-plugged, with a GPIO that detects their
++ * presence. Transfers pass through to the parent bus while the detect GPIO
++ * has been active for the debounce time and fail with -ENODEV otherwise, so
++ * drivers of devices on this bus see a detach as a transfer error.
++ */
++
++#include <dm.h>
++#include <i2c.h>
++#include <log.h>
++#include <time.h>
++#include <asm/gpio.h>
++
++#define I2C_HOTPLUG_DEBOUNCE_MS	20
++
++struct i2c_hotplug_priv {
++	struct udevice *parent;
++	struct gpio_desc detect;
++	bool active;
++	ulong active_since;
++};
++
++static bool i2c_hotplug_connected(struct udevice *dev)
++{
++	struct i2c_hotplug_priv *priv = dev_get_priv(dev);
++
++	if (dm_gpio_get_value(&priv->detect) <= 0) {
++		priv->active = false;
++		return false;
++	}
++	if (!priv->active) {
++		priv->active = true;
++		priv->active_since = get_timer(0);
++	}
++
++	return get_timer(priv->active_since) >= I2C_HOTPLUG_DEBOUNCE_MS;
++}
++
++static int i2c_hotplug_xfer(struct udevice *dev, struct i2c_msg *msg,
++			    int nmsgs)
++{
++	struct i2c_hotplug_priv *priv = dev_get_priv(dev);
++	struct dm_i2c_ops *ops = i2c_get_ops(priv->parent);
++
++	if (!i2c_hotplug_connected(dev))
++		return -ENODEV;
++	if (!ops->xfer)
++		return -ENOSYS;
++
++	return ops->xfer(priv->parent, msg, nmsgs);
++}
++
++static int i2c_hotplug_probe_chip(struct udevice *dev, uint chip_addr,
++				  uint chip_flags)
++{
++	struct i2c_hotplug_priv *priv = dev_get_priv(dev);
++	struct dm_i2c_ops *ops = i2c_get_ops(priv->parent);
++
++	if (!i2c_hotplug_connected(dev))
++		return -ENODEV;
++	if (!ops->probe_chip)
++		return -ENOSYS;
++
++	return ops->probe_chip(priv->parent, chip_addr, chip_flags);
++}
++
++static int i2c_hotplug_probe(struct udevice *dev)
++{
++	struct i2c_hotplug_priv *priv = dev_get_priv(dev);
++	int ret;
++
++	ret = uclass_get_device_by_phandle(UCLASS_I2C, dev, "i2c-parent",
++					   &priv->parent);
++	if (ret)
++		return log_msg_ret("parent", ret);
++
++	ret = gpio_request_by_name(dev, "detect-gpios", 0, &priv->detect,
++				   GPIOD_IS_IN);
++	if (ret)
++		return log_msg_ret("detect", ret);
++
++	return 0;
++}
++
++static const struct dm_i2c_ops i2c_hotplug_ops = {
++	.xfer		= i2c_hotplug_xfer,
++	.probe_chip	= i2c_hotplug_probe_chip,
++};
++
++static const struct udevice_id i2c_hotplug_ids[] = {
++	{ .compatible = "i2c-hotplug-gpio" },
++	{ }
++};
++
++U_BOOT_DRIVER(i2c_hotplug_gpio) = {
++	.name		= "i2c_hotplug_gpio",
++	.id		= UCLASS_I2C,
++	.of_match	= i2c_hotplug_ids,
++	.probe		= i2c_hotplug_probe,
++	.priv_auto	= sizeof(struct i2c_hotplug_priv),
++	.ops		= &i2c_hotplug_ops,
++};
+-- 
+2.50.1
+

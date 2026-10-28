@@ -1,0 +1,749 @@
+From 7131ac8fc9d8582100411174b8d76b3f253b4606 Mon Sep 17 00:00:00 2001
+From: Curd Becker <me@curd-becker.de>
+Date: Tue, 27 Oct 2026 16:53:56 +0000
+Subject: [PATCH 4/5] input: add a polled HID-over-I2C keyboard driver
+
+Keyboards on HID over I2C (compatible "hid-over-i2c"), such as the
+Microsoft Surface RT Type Cover, have no driver in U-Boot. HID over I2C
+has no boot protocol, so the input report layout must come from the
+device's report descriptor; the Type Cover's keyboard report, for
+example, has ten key slots and no reserved byte after the modifiers.
+
+hid_kbd gains hid_kbd_parse_layout(), which walks the report descriptor
+for the keyboard application collection and takes from it the report ID,
+the 8-bit modifier field (usages E0-E7) and the array of 8-bit key
+usages, both byte-aligned. That is the shape of boot-like keyboards and
+of the Type Cover, and keeps the parser to the items it needs (usage
+page, usages, report ID, size and count, push/pop, collections, input).
+Porting Linux hid-core's parser was rejected as far beyond what a
+console keyboard needs. Key events come from hid_kbd_update(); reports
+in a rollover or error state keep the previous keys.
+
+The device protocol follows Linux i2c-hid: the HID descriptor is read
+from "hid-descr-addr"; initialisation is SET_POWER ON (retried once after
+500 us), RESET, up to 1 s for the zero-length reset response, SET_POWER
+ON again; input is a plain read of wMaxInputLength bytes. The driver
+enables "vdd-supply" and "vddl-supply" and waits
+"post-power-on-delay-ms".
+
+U-Boot polls, so the interrupt line is read as a GPIO, taken from the
+node's "interrupts" with its interrupt parent as the GPIO controller
+(two cells, the first the GPIO number, as on Tegra); input is read only
+while it is asserted.
+
+The device may be absent at probe and may be detached and re-attached at
+any time: the stdio device is registered at probe without touching the
+device, and the device is initialised on the first poll that reaches it.
+A transfer error releases all held keys and marks the device detached;
+initialisation is retried every 100 ms. While attached and idle, a
+4-byte read of the HID descriptor every 100 ms checks the device is still
+there, because a detached device's interrupt line stays inactive and no
+input read would notice. A device whose descriptor has no supported
+keyboard is left alone until it is detached. A detach and re-attach
+while nothing polls the console (during a long-running command) is not
+seen; the device then stays uninitialised.
+
+With ACPIGEN the generic I2C chip driver binds the same compatible, so
+the driver depends on !ACPIGEN.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/input/Kconfig       |  13 ++
+ drivers/input/Makefile      |   1 +
+ drivers/input/hid_kbd.c     | 157 +++++++++++++
+ drivers/input/i2c_hid_kbd.c | 426 ++++++++++++++++++++++++++++++++++++
+ include/hid_kbd.h           |  37 ++++
+ 5 files changed, 634 insertions(+)
+ create mode 100644 drivers/input/i2c_hid_kbd.c
+
+diff --git a/drivers/input/Kconfig b/drivers/input/Kconfig
+index 997b230cf08..aa3ebaecfa1 100644
+--- a/drivers/input/Kconfig
++++ b/drivers/input/Kconfig
+@@ -53,6 +53,19 @@ config APPLE_SPI_KEYB
+ 	  laptops based on Apple SoCs. These keyboards use an
+ 	  Apple-specific HID-over-SPI protocol.
+ 
++config I2C_HID_KEYBOARD
++	bool "Enable HID-over-I2C keyboard support"
++	depends on DM_KEYBOARD && DM_I2C && DM_GPIO && !ACPIGEN
++	select HID_KBD
++	help
++	  This adds a polled driver for keyboards attached over HID over I2C
++	  (compatible "hid-over-i2c"), such as the Microsoft Surface RT Type
++	  Cover. The keyboard's input report must carry the modifiers as an
++	  8-bit field and the keys as an array of 8-bit usages. The device's
++	  interrupt parent must be its GPIO controller. Devices that are
++	  attached later or re-attached are picked up, for example on an
++	  "i2c-hotplug-gpio" bus.
++
+ config BUTTON_KEYBOARD
+ 	bool "Buttons as keyboard"
+ 	depends on DM_KEYBOARD && DM_GPIO
+diff --git a/drivers/input/Makefile b/drivers/input/Makefile
+index 674f53b3c27..051f9f3d0d1 100644
+--- a/drivers/input/Makefile
++++ b/drivers/input/Makefile
+@@ -13,6 +13,7 @@ ifndef CONFIG_XPL_BUILD
+ 
+ obj-$(CONFIG_APPLE_SPI_KEYB) += apple_spi_kbd.o
+ obj-$(CONFIG_HID_KBD) += hid_kbd.o
++obj-$(CONFIG_I2C_HID_KEYBOARD) += i2c_hid_kbd.o
+ obj-$(CONFIG_I8042_KEYB) += i8042.o
+ obj-$(CONFIG_TEGRA_KEYBOARD) += input.o tegra-kbc.o
+ obj-$(CONFIG_TWL4030_INPUT) += twl4030.o
+diff --git a/drivers/input/hid_kbd.c b/drivers/input/hid_kbd.c
+index bd937eb6307..ec1a05bdccb 100644
+--- a/drivers/input/hid_kbd.c
++++ b/drivers/input/hid_kbd.c
+@@ -5,10 +5,167 @@
+ 
+ #include <hid_kbd.h>
+ #include <input.h>
++#include <linux/errno.h>
+ #include <linux/input.h>
+ #include <linux/kernel.h>
+ #include <linux/string.h>
+ 
++#define HID_PAGE_GENERIC_DESKTOP	0x01
++#define HID_PAGE_KEYBOARD		0x07
++#define HID_USAGE_KEYBOARD		0x06
++#define HID_COLLECTION_APPLICATION	0x01
++#define HID_MAIN_CONSTANT		BIT(0)
++#define HID_MAIN_VARIABLE		BIT(1)
++#define HID_PUSH_DEPTH			4
++
++struct hid_globals {
++	u16 usage_page;
++	u8 report_id;
++	u32 report_size;
++	u32 report_count;
++};
++
++/* A 4-byte usage carries its page; shorter ones take the page at the main item */
++struct hid_usage {
++	u32 value;
++	bool extended;
++	bool present;
++};
++
++static u32 hid_usage_resolve(const struct hid_usage *u, u16 page)
++{
++	return u->extended ? u->value : (u32)page << 16 | (u->value & 0xffff);
++}
++
++int hid_kbd_parse_layout(const u8 *rdesc, uint len,
++			 struct hid_kbd_layout *layout)
++{
++	struct hid_globals g = { 0 }, stack[HID_PUSH_DEPTH];
++	struct hid_usage usage = { 0 }, umin = { 0 }, umax = { 0 };
++	u16 bits[256] = { 0 };
++	int sp = 0, depth = 0, kbd_depth = 0;
++	bool have_mods = false, have_keys = false;
++	uint i = 0;
++
++	memset(layout, 0, sizeof(*layout));
++	while (i < len) {
++		u8 prefix = rdesc[i];
++		uint size, n;
++		u32 val = 0;
++
++		if (prefix == 0xfe) {	/* long item */
++			if (i + 1 >= len)
++				break;
++			i += 3 + rdesc[i + 1];
++			continue;
++		}
++		size = (prefix & 3) == 3 ? 4 : prefix & 3;
++		if (i + 1 + size > len)
++			break;
++		for (n = 0; n < size; n++)
++			val |= (u32)rdesc[i + 1 + n] << (8 * n);
++		i += 1 + size;
++
++		switch (prefix & 0xfc) {
++		case 0x04:	/* Usage Page */
++			g.usage_page = val;
++			break;
++		case 0x74:	/* Report Size */
++			g.report_size = val;
++			break;
++		case 0x84:	/* Report ID */
++			g.report_id = val;
++			break;
++		case 0x94:	/* Report Count */
++			g.report_count = val;
++			break;
++		case 0xa4:	/* Push */
++			if (sp == HID_PUSH_DEPTH)
++				return -E2BIG;
++			stack[sp++] = g;
++			break;
++		case 0xb4:	/* Pop */
++			if (!sp)
++				return -EINVAL;
++			g = stack[--sp];
++			break;
++		case 0x08:	/* Usage */
++			if (!usage.present)
++				usage = (struct hid_usage){ val, size == 4, true };
++			break;
++		case 0x18:	/* Usage Minimum */
++			umin = (struct hid_usage){ val, size == 4, true };
++			break;
++		case 0x28:	/* Usage Maximum */
++			umax = (struct hid_usage){ val, size == 4, true };
++			break;
++		case 0xa0:	/* Collection */
++			depth++;
++			if (!kbd_depth && val == HID_COLLECTION_APPLICATION &&
++			    usage.present &&
++			    hid_usage_resolve(&usage, g.usage_page) ==
++			    (HID_PAGE_GENERIC_DESKTOP << 16 | HID_USAGE_KEYBOARD))
++				kbd_depth = depth;
++			break;
++		case 0xc0:	/* End Collection */
++			if (depth == kbd_depth)
++				kbd_depth = 0;
++			if (depth)
++				depth--;
++			break;
++		case 0x80: {	/* Input */
++			u32 off = bits[g.report_id];
++			u32 page = umin.present ?
++				   hid_usage_resolve(&umin, g.usage_page) >> 16 :
++				   g.usage_page;
++			bool same_id;
++
++			if (kbd_depth && !(val & HID_MAIN_CONSTANT) &&
++			    page == HID_PAGE_KEYBOARD && !(off % 8)) {
++				same_id = layout->report_id == g.report_id;
++				if (!have_mods && (val & HID_MAIN_VARIABLE) &&
++				    g.report_size == 1 && g.report_count == 8 &&
++				    umin.present && umax.present &&
++				    (umin.value & 0xffff) == 0xe0 &&
++				    (umax.value & 0xffff) == 0xe7 &&
++				    (!have_keys || same_id)) {
++					layout->report_id = g.report_id;
++					layout->mod_offset = off / 8;
++					have_mods = true;
++				} else if (!have_keys &&
++					   !(val & HID_MAIN_VARIABLE) &&
++					   g.report_size == 8 &&
++					   (!have_mods || same_id)) {
++					layout->report_id = g.report_id;
++					layout->keys_offset = off / 8;
++					layout->nkeys = min_t(u32, g.report_count,
++							      HID_KBD_MAX_KEYS);
++					have_keys = true;
++				}
++			}
++			off += g.report_size * g.report_count;
++			if (off > U16_MAX)
++				return -E2BIG;
++			bits[g.report_id] = off;
++			break;
++		}
++		}
++
++		if ((prefix & 0x0c) == 0x00) {	/* main item ends the locals */
++			usage.present = false;
++			umin.present = false;
++			umax.present = false;
++		}
++	}
++
++	if (!have_mods || !have_keys)
++		return -ENOENT;
++	layout->len = max(layout->mod_offset + 1,
++			  layout->keys_offset + layout->nkeys);
++
++	return 0;
++}
++
+ /* Keyboard/Keypad usage to key code */
+ static const u8 hid_kbd_keymap[] = {
+ 	KEY_RESERVED, 0xff, 0xff, 0xff,
+diff --git a/drivers/input/i2c_hid_kbd.c b/drivers/input/i2c_hid_kbd.c
+new file mode 100644
+index 00000000000..5352ebc1b79
+--- /dev/null
++++ b/drivers/input/i2c_hid_kbd.c
+@@ -0,0 +1,426 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Keyboard on a HID-over-I2C device.
++ *
++ * The keyboard report's layout comes from the report descriptor
++ * (hid_kbd_parse_layout()). The device is polled: input is read only while
++ * its interrupt line is asserted, and while it is idle a short descriptor
++ * read every I2C_HID_POLL_MS checks that it is still there. A transfer
++ * error marks the device detached; it is re-initialised as soon as
++ * transfers succeed again, so it can be attached after probe and
++ * re-attached.
++ */
++
++#include <dm.h>
++#include <hid_kbd.h>
++#include <i2c.h>
++#include <keyboard.h>
++#include <log.h>
++#include <malloc.h>
++#include <stdio_dev.h>
++#include <time.h>
++#include <asm/gpio.h>
++#include <asm/unaligned.h>
++#include <dm/device_compat.h>
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++#include <linux/delay.h>
++#include <power/regulator.h>
++
++#define I2C_HID_OPCODE_RESET		0x01
++#define I2C_HID_OPCODE_SET_POWER	0x08
++#define I2C_HID_PWR_ON			0x00
++#define I2C_HID_BCD_VERSION		0x0100
++
++#define I2C_HID_RESET_TIMEOUT_MS	1000
++#define I2C_HID_POLL_MS			100
++
++#define HID_USAGE_ERROR_UNDEFINED	0x03
++
++struct i2c_hid_desc {
++	__le16 wHIDDescLength;
++	__le16 bcdVersion;
++	__le16 wReportDescLength;
++	__le16 wReportDescRegister;
++	__le16 wInputRegister;
++	__le16 wMaxInputLength;
++	__le16 wOutputRegister;
++	__le16 wMaxOutputLength;
++	__le16 wCommandRegister;
++	__le16 wDataRegister;
++	__le16 wVendorID;
++	__le16 wProductID;
++	__le16 wVersionID;
++	__le32 reserved;
++} __packed;
++
++enum i2c_hid_kbd_state {
++	I2C_HID_KBD_DETACHED,
++	I2C_HID_KBD_ATTACHED,
++	/* Attached, but its report descriptor has no supported keyboard */
++	I2C_HID_KBD_UNSUPPORTED,
++};
++
++struct i2c_hid_kbd_priv {
++	struct gpio_desc irq;
++	u16 desc_reg;
++	enum i2c_hid_kbd_state state;
++	ulong last_poll;
++	struct i2c_hid_desc desc;
++	struct hid_kbd_layout layout;
++	u8 *inbuf;
++	u16 inbuf_len;
++	u8 mods;
++	u8 keys[HID_KBD_MAX_KEYS];
++};
++
++static int i2c_hid_xfer(struct udevice *dev, u8 *wbuf, int wlen, u8 *rbuf,
++			int rlen)
++{
++	struct dm_i2c_chip *chip = dev_get_parent_plat(dev);
++	struct i2c_msg msg[2];
++	int n = 0;
++
++	if (wlen) {
++		msg[n].addr = chip->chip_addr;
++		msg[n].flags = 0;
++		msg[n].len = wlen;
++		msg[n].buf = wbuf;
++		n++;
++	}
++	if (rlen) {
++		msg[n].addr = chip->chip_addr;
++		msg[n].flags = I2C_M_RD;
++		msg[n].len = rlen;
++		msg[n].buf = rbuf;
++		n++;
++	}
++
++	return dm_i2c_xfer(dev, msg, n);
++}
++
++static int i2c_hid_read_register(struct udevice *dev, u16 reg, void *buf,
++				 int len)
++{
++	u8 cmd[2] = { reg & 0xff, reg >> 8 };
++
++	return i2c_hid_xfer(dev, cmd, sizeof(cmd), buf, len);
++}
++
++static int i2c_hid_command(struct udevice *dev, u8 opcode, u8 arg)
++{
++	struct i2c_hid_kbd_priv *priv = dev_get_priv(dev);
++	u16 reg = le16_to_cpu(priv->desc.wCommandRegister);
++	u8 cmd[4] = { reg & 0xff, reg >> 8, arg, opcode };
++
++	return i2c_hid_xfer(dev, cmd, sizeof(cmd), NULL, 0);
++}
++
++static int i2c_hid_set_power_on(struct udevice *dev)
++{
++	int ret;
++
++	ret = i2c_hid_command(dev, I2C_HID_OPCODE_SET_POWER, I2C_HID_PWR_ON);
++	if (ret) {
++		/* some devices need time to wake from deep sleep */
++		udelay(500);
++		ret = i2c_hid_command(dev, I2C_HID_OPCODE_SET_POWER,
++				      I2C_HID_PWR_ON);
++	}
++
++	return ret;
++}
++
++/* Returns the length field of the input, 0 for a reset response */
++static int i2c_hid_read_input(struct udevice *dev)
++{
++	struct i2c_hid_kbd_priv *priv = dev_get_priv(dev);
++	int ret;
++
++	ret = i2c_hid_xfer(dev, NULL, 0, priv->inbuf, priv->inbuf_len);
++	if (ret)
++		return ret;
++
++	return get_unaligned_le16(priv->inbuf);
++}
++
++static int i2c_hid_reset(struct udevice *dev)
++{
++	struct i2c_hid_kbd_priv *priv = dev_get_priv(dev);
++	ulong start;
++	int ret;
++
++	ret = i2c_hid_set_power_on(dev);
++	if (ret)
++		return ret;
++	ret = i2c_hid_command(dev, I2C_HID_OPCODE_RESET, 0);
++	if (ret)
++		return ret;
++
++	start = get_timer(0);
++	while (get_timer(start) < I2C_HID_RESET_TIMEOUT_MS) {
++		if (dm_gpio_get_value(&priv->irq) > 0) {
++			ret = i2c_hid_read_input(dev);
++			if (ret < 0)
++				return ret;
++			if (!ret)
++				break;
++		}
++		mdelay(1);
++	}
++
++	return i2c_hid_set_power_on(dev);
++}
++
++static bool i2c_hid_present(struct udevice *dev)
++{
++	struct i2c_hid_kbd_priv *priv = dev_get_priv(dev);
++	u8 hdr[4];
++
++	return !i2c_hid_read_register(dev, priv->desc_reg, hdr, sizeof(hdr)) &&
++	       get_unaligned_le16(hdr) == sizeof(struct i2c_hid_desc) &&
++	       get_unaligned_le16(hdr + 2) == I2C_HID_BCD_VERSION;
++}
++
++static void i2c_hid_kbd_update(struct input_config *input, u8 mods,
++			       const u8 *keys)
++{
++	struct i2c_hid_kbd_priv *priv = dev_get_priv(input->dev);
++	uint nkeys = priv->layout.nkeys;
++
++	hid_kbd_update(input, priv->mods, priv->keys, mods, keys, nkeys);
++	priv->mods = mods;
++	memcpy(priv->keys, keys, nkeys);
++}
++
++static void i2c_hid_kbd_report(struct input_config *input, int len)
++{
++	struct i2c_hid_kbd_priv *priv = dev_get_priv(input->dev);
++	struct hid_kbd_layout *l = &priv->layout;
++	u8 *report = priv->inbuf + 2;
++	uint i;
++
++	if (len < 2 || len > priv->inbuf_len)
++		return;
++	len -= 2;
++	if (l->report_id) {
++		if (!len || report[0] != l->report_id)
++			return;
++		report++;
++		len--;
++	}
++	if (len < l->len)
++		return;
++
++	/* rollover and error states keep the previous keys */
++	for (i = 0; i < l->nkeys; i++)
++		if (report[l->keys_offset + i] &&
++		    report[l->keys_offset + i] <= HID_USAGE_ERROR_UNDEFINED)
++			return;
++
++	i2c_hid_kbd_update(input, report[l->mod_offset],
++			   report + l->keys_offset);
++}
++
++static void i2c_hid_kbd_detach(struct input_config *input)
++{
++	struct i2c_hid_kbd_priv *priv = dev_get_priv(input->dev);
++	static const u8 none[HID_KBD_MAX_KEYS];
++
++	i2c_hid_kbd_update(input, 0, none);
++	free(priv->inbuf);
++	priv->inbuf = NULL;
++	priv->state = I2C_HID_KBD_DETACHED;
++}
++
++static int i2c_hid_kbd_attach(struct udevice *dev)
++{
++	struct i2c_hid_kbd_priv *priv = dev_get_priv(dev);
++	uint rdesc_len;
++	u8 *rdesc;
++	int ret;
++
++	ret = i2c_hid_read_register(dev, priv->desc_reg, &priv->desc,
++				    sizeof(priv->desc));
++	if (ret)
++		return ret;
++	if (le16_to_cpu(priv->desc.wHIDDescLength) != sizeof(priv->desc) ||
++	    le16_to_cpu(priv->desc.bcdVersion) != I2C_HID_BCD_VERSION)
++		return -EPROTO;
++
++	priv->inbuf_len = max_t(u16, le16_to_cpu(priv->desc.wMaxInputLength), 2);
++	priv->inbuf = malloc(priv->inbuf_len);
++	if (!priv->inbuf)
++		return -ENOMEM;
++
++	ret = i2c_hid_reset(dev);
++	if (ret)
++		goto err;
++
++	rdesc_len = le16_to_cpu(priv->desc.wReportDescLength);
++	rdesc = malloc(rdesc_len);
++	if (!rdesc) {
++		ret = -ENOMEM;
++		goto err;
++	}
++	ret = i2c_hid_read_register(dev,
++				    le16_to_cpu(priv->desc.wReportDescRegister),
++				    rdesc, rdesc_len);
++	if (!ret) {
++		if (hid_kbd_parse_layout(rdesc, rdesc_len, &priv->layout) ||
++		    2 + !!priv->layout.report_id + priv->layout.len >
++		    priv->inbuf_len)
++			ret = -EPROTONOSUPPORT;
++	}
++	free(rdesc);
++	if (ret)
++		goto err;
++
++	priv->mods = 0;
++	memset(priv->keys, 0, sizeof(priv->keys));
++
++	return 0;
++
++err:
++	free(priv->inbuf);
++	priv->inbuf = NULL;
++
++	return ret;
++}
++
++static int i2c_hid_kbd_read_keys(struct input_config *input)
++{
++	struct udevice *dev = input->dev;
++	struct i2c_hid_kbd_priv *priv = dev_get_priv(dev);
++	int ret;
++
++	if (priv->state == I2C_HID_KBD_ATTACHED &&
++	    dm_gpio_get_value(&priv->irq) > 0) {
++		priv->last_poll = get_timer(0);
++		ret = i2c_hid_read_input(dev);
++		if (ret < 0) {
++			i2c_hid_kbd_detach(input);
++			return 0;
++		}
++		i2c_hid_kbd_report(input, ret);
++		return 1;
++	}
++
++	if (get_timer(priv->last_poll) < I2C_HID_POLL_MS)
++		return 0;
++	priv->last_poll = get_timer(0);
++
++	if (priv->state != I2C_HID_KBD_DETACHED) {
++		if (!i2c_hid_present(dev))
++			i2c_hid_kbd_detach(input);
++		return 0;
++	}
++
++	ret = i2c_hid_kbd_attach(dev);
++	if (!ret) {
++		priv->state = I2C_HID_KBD_ATTACHED;
++	} else if (ret == -EPROTONOSUPPORT) {
++		dev_warn(dev, "no supported keyboard in the report descriptor\n");
++		priv->state = I2C_HID_KBD_UNSUPPORTED;
++	}
++
++	return 0;
++}
++
++/* The interrupt parent must be the GPIO controller, with GPIO-numbered cells */
++static int i2c_hid_kbd_get_irq(struct udevice *dev, struct gpio_desc *desc)
++{
++	struct gpio_dt_spec spec = {
++		.list_name = "interrupts",
++		.flags = GPIOD_IS_IN,
++		.present = true,
++	};
++	u32 irq[2];
++	int ret;
++
++	spec.args.node = ofnode_parse_phandle(dev_ofnode(dev),
++					      "interrupt-parent", 0);
++	if (!ofnode_valid(spec.args.node) ||
++	    !ofnode_read_bool(spec.args.node, "gpio-controller") ||
++	    ofnode_read_u32_default(spec.args.node, "#interrupt-cells", 0) != 2)
++		return -EINVAL;
++
++	ret = dev_read_u32_array(dev, "interrupts", irq, ARRAY_SIZE(irq));
++	if (ret)
++		return ret;
++	spec.args.args_count = 2;
++	spec.args.args[0] = irq[0];
++	spec.args.args[1] = irq[1] & (IRQ_TYPE_EDGE_FALLING | IRQ_TYPE_LEVEL_LOW) ?
++			    GPIO_ACTIVE_LOW : GPIO_ACTIVE_HIGH;
++
++	return gpio_request_parsed(dev, &spec, desc);
++}
++
++static int i2c_hid_kbd_probe(struct udevice *dev)
++{
++	static const char *const supplies[] = { "vdd-supply", "vddl-supply" };
++	struct i2c_hid_kbd_priv *priv = dev_get_priv(dev);
++	struct keyboard_priv *uc_priv = dev_get_uclass_priv(dev);
++	struct stdio_dev *sdev = &uc_priv->sdev;
++	struct input_config *input = &uc_priv->input;
++	struct udevice *supply;
++	uint i;
++	u32 reg;
++	int ret;
++
++	ret = dev_read_u32(dev, "hid-descr-addr", &reg);
++	if (ret)
++		return log_msg_ret("descr", ret);
++	priv->desc_reg = reg;
++
++	for (i = 0; i < ARRAY_SIZE(supplies); i++) {
++		ret = device_get_supply_regulator(dev, supplies[i], &supply);
++		if (!ret)
++			ret = regulator_set_enable_if_allowed(supply, true);
++		if (ret && ret != -ENOENT && ret != -ENOSYS)
++			return log_msg_ret("supply", ret);
++	}
++	mdelay(dev_read_u32_default(dev, "post-power-on-delay-ms", 0));
++
++	ret = i2c_hid_kbd_get_irq(dev, &priv->irq);
++	if (ret)
++		return log_msg_ret("irq", ret);
++
++	priv->state = I2C_HID_KBD_DETACHED;
++	priv->last_poll = get_timer(0) - I2C_HID_POLL_MS;
++
++	input->dev = dev;
++	input->read_keys = i2c_hid_kbd_read_keys;
++	input_add_tables(input, false);
++	strlcpy(sdev->name, "i2c-hid-kbd", sizeof(sdev->name));
++
++	return input_stdio_register(sdev);
++}
++
++static int i2c_hid_kbd_remove(struct udevice *dev)
++{
++	struct i2c_hid_kbd_priv *priv = dev_get_priv(dev);
++
++	free(priv->inbuf);
++	priv->inbuf = NULL;
++
++	return 0;
++}
++
++static const struct keyboard_ops i2c_hid_kbd_ops = {
++};
++
++static const struct udevice_id i2c_hid_kbd_ids[] = {
++	{ .compatible = "hid-over-i2c" },
++	{ }
++};
++
++U_BOOT_DRIVER(i2c_hid_kbd) = {
++	.name		= "i2c_hid_kbd",
++	.id		= UCLASS_KEYBOARD,
++	.of_match	= i2c_hid_kbd_ids,
++	.probe		= i2c_hid_kbd_probe,
++	.remove		= i2c_hid_kbd_remove,
++	.priv_auto	= sizeof(struct i2c_hid_kbd_priv),
++	.ops		= &i2c_hid_kbd_ops,
++};
+diff --git a/include/hid_kbd.h b/include/hid_kbd.h
+index 1e8733de868..2db0a8de137 100644
+--- a/include/hid_kbd.h
++++ b/include/hid_kbd.h
+@@ -10,6 +10,43 @@
+ 
+ struct input_config;
+ 
++#define HID_KBD_MAX_KEYS	16
++
++/**
++ * struct hid_kbd_layout - where a keyboard input report holds its state
++ *
++ * Offsets are in bytes from the start of the report after its report ID.
++ *
++ * @report_id:	report ID of the keyboard input report, 0 if reports carry none
++ * @mod_offset:	offset of the modifier bits (usages E0-E7)
++ * @keys_offset: offset of the array of key usages
++ * @nkeys:	entries used of the key array, at most HID_KBD_MAX_KEYS
++ * @len:	length of the report up to the end of both
++ */
++struct hid_kbd_layout {
++	u8 report_id;
++	u16 mod_offset;
++	u16 keys_offset;
++	u8 nkeys;
++	u16 len;
++};
++
++/**
++ * hid_kbd_parse_layout() - find the keyboard input report in a report descriptor
++ *
++ * Looks in the keyboard application collection for an input report that
++ * holds the modifiers as eight 1-bit variables (usages E0-E7) and the keys
++ * as an array of 8-bit Keyboard/Keypad usages, both byte-aligned.
++ *
++ * @rdesc:	report descriptor
++ * @len:	length of @rdesc in bytes
++ * @layout:	returns the layout of the report
++ * Return: 0 if found, -ENOENT if there is no such report, other -ve if
++ *	the descriptor exceeds what is parsed
++ */
++int hid_kbd_parse_layout(const u8 *rdesc, uint len,
++			 struct hid_kbd_layout *layout);
++
+ /**
+  * hid_kbd_update() - report a change of HID keyboard state as key events
+  *
+-- 
+2.50.1
+

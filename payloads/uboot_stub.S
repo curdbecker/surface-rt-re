@@ -1,13 +1,14 @@
 @ Design-C loader stub for SecureT30Sec: boot U-Boot in place of the UEFI image.
 @
-@ Delivered by the first stage's unsigned pre-verification write (boot-chain.md, weakness 1): both NVDAUEFI image
+@ Delivered by the first stage's unsigned pre-verification write: both NVDAUEFI image
 @ entries (normal and watchdog-backup) point at this stub and UEFIDATA.load_address aims at the Pkcs7Verify entry,
 @ so read_image_block writes the stub over the verify routine before the stage reaches its `bl Pkcs7Verify` — the
 @ call then runs the stub. No genuine image, no signature. The stub disarms the stage's watchdog (armed before
 @ every verification), loads stock U-Boot (SPL + proper) from its eMMC slot to the SPL load address (uboot_stub.h),
 @ cleans the data cache so the image reaches DRAM, and hands the SPL to the AVP exactly as the APX path does: SPL
 @ brings the clocks up and resets the A9 cleanly, so U-Boot proper starts from a fresh A9 instead of the state the
-@ first stage left. The A9 then only parks until the SPL resets it.
+@ first stage left. The A9 then only parks until the SPL resets it. It also sets the launch marker (uboot_stub.h)
+@ so U-Boot's board code knows this was the eMMC path and boots normally, rather than the APX path which fastboots.
 @
 @ The FN_* addresses are the first stage's own routines (securet30sec_functions.h, generated from the loader's
 @ FUNCTIONS); ARM state throughout. The stub never returns, so clobbering lr and the verify routine is fine.
@@ -74,6 +75,11 @@ _start:
 2:  b    2b
 1:
 #endif
+    @ Mark the eMMC launch path for U-Boot's board code (uboot_stub.h); when this is absent U-Boot was RAM-loaded
+    @ over APX and enters fastboot instead. Survives the hand-off in a PMC always-on scratch register.
+    ldr  r0, =LAUNCH_MARKER
+    ldr  r1, =LAUNCH_MAGIC
+    str  r1, [r0]
     checkpoint 1                @ the stub runs in place of Pkcs7Verify
 #ifdef BOOTTRACE
     ldr  r0, =PMC_SCRATCH0

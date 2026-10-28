@@ -1,4 +1,4 @@
-# Surface RT platform notes (power management, Windows RT side)
+# Surface RT platform notes (power management, Type Cover, main UEFI and monitor, Windows RT side)
 
 Board: Tegra30 (T30), Cardhu-derived. Power: TI TPS659110 PMIC (`ti,tps65911`, I2C5 `0x2d`) and TPS62361 core
 regulator (I2C5 `0x60`); the embedded controller (battery, charger) sits on the same bus at `0x0a`. Reference
@@ -39,48 +39,64 @@ that agree:
 
 PMIC GPIO2 (`0x62` = `0x87`: forced low in SLEEP, set high, reads high) shows the PMIC is ACTIVE while Linux runs.
 
-### Reboot and power-off hang (root cause)
+## Type Cover
 
-`tps65910_shutdown()` (`drivers/regulator/tps65910-regulator.c`) takes every registered rail off external control
-during the driver shutdown phase. For `vdd_cpu` that clears `VDDCTRL_EN1`, the CPU rail drops, and the board hangs
-before the PMIC power-off or restart command is sent. The PMIC stays on: black screen, recovery only with a long
-press of the power button. With the hook disabled, `reboot` and `poweroff` both work.
+### Wiring
 
-`ti,regulator-ext-sleep-control = <1>` on `vddctrl` keeps the probe from clearing the firmware's EN1 assignment;
-without it the probe would do the same as the shutdown hook.
+From the libre-tegra device tree (`tegra30-microsoft-surface-rt.dts`), working under Linux:
 
-Fix: `vendor/0002-…` adds the PMIC property `ti,keep-ext-sleep-control-on-shutdown` (binding, driver: the hook
-returns early) and sets it for the Surface RT. With it, Linux keeps the EN1 assignment; the PMIC's `DEV_OFF_RST`
-(restart) and `DEV_OFF` (power-off) end it along with everything else. Opt-in, because the hook does no harm where
-removing the external control leaves the rail on (the data sheet's behaviour; Transformers, Nexus 7, Chagall with
-Android bootloaders). Tested on the Surface RT: `reboot` and `poweroff` work.
-
-Measurements that led there:
-
-| Test | Result |
+| Item | Value |
 |---|---|
-| PMC `MAIN_RST` written with `devmem2`, EN1 assignment and SR = 0 left as they are | board dark, PMIC on |
-| same, with `VDDCTRL_SR` set to the OP value first | reboots |
-| `EN1_SMPS_ASS` cleared, SR = 0 | dies at once, backlight off |
-| `EN1_SMPS_ASS` cleared, SR = OP value | dies at once, backlight on |
-| `DEV_OFF_RST` written from userspace | cold restart |
-| `reboot` / `poweroff` with `tps65910_shutdown()` disabled | both work |
+| Bus | I2C1 (`i2c@7000c000`, `lcd_ddc`), 400 kHz; shared with the sensor hub (HID, `0x28`) |
+| Address | `0x00` (the general-call address; Linux's I2C core has a Surface RT/2 exception to accept it) |
+| HID descriptor register | `0x0041` |
+| Attach detect | GPIO S0, active high (cover attached) |
+| Interrupt | GPIO O5, level low |
+| Supplies | TPS65911 LDO3 `vdd_cover` 2.8 V, LDO1 `vddio_sensor` 1.8 V |
 
-So the PMC reset drops EN1 (the CPU rail falls to SR), and clearing the EN1 assignment is fatal on this board
-whatever SR holds. The TPS65911 data sheet says clearing it has no effect (the rail then follows its registers:
-`0x27` ST = on, OP voltage); why it kills the board here is open.
+Linux drives it with the generic `i2c-hid` stack, no device-specific code: the cover sits under an
+`i2c-hotplug-gpio` node, a pass-through I2C adapter that is added while S0 is high and removed while it is low.
 
-The firmware's own `ResetSystem` (`firststage.md`) also clears `EN1_SMPS_ASS` (to `0x00`), as its last PMIC write,
-followed by two unidentified optional hooks and PMC `MAIN_RST`, with no delay. Hypothesis, fits all measurements
-but not tested: the reset lands before the rail collapses, and after it the bootloader, which runs on the AVP
-rather than the CPUs, powers the CPU rail under register control. It may also depend on firmware state we do not
-know (the hooks, the sleep registers Linux clears at probe).
+### HID reports
 
-### Open
+The cover enumerates as `045E:079C`. Input reports from its report descriptor:
 
-- Why clearing `VDDCTRL_EN1` is fatal (PMIC EEPROM variant or board wiring).
-- Deep suspend and LP2 CPU idle under the monitor is moot under the U-Boot route (`boot-chain.md`): without the
-  monitor in the boot path, Linux drives the stock Tegra30 idle path directly.
+| ID | Collection | Input layout |
+|---|---|---|
+| 1 | Keyboard | modifiers (8 bits, usages `E0`–`E7`), then 10 key bytes (array, usages `00`–`91`); 12 bytes with the ID |
+| 2 | Mouse (touchpad) | 5 buttons, 3 bits padding, relative X, Y, wheel, AC pan (8 bits each) |
+| 3 | Consumer control | one 16-bit usage, `000`–`3FF` |
+| 7 | Vendor page `FF05` | 2 bytes and 32 bytes; output reports of the same shape |
+
+The keyboard report has no reserved byte after the modifiers and 10 key slots, so it is not the boot-keyboard
+layout. The descriptor has no LED output report. The other HID-over-I2C devices on the board are the Atmel
+touchscreen (`03EB:8207`, I2C2 `0x5b`) and the sensor hub (`045E:0798`).
+
+U-Boot takes the cover as console input (`stdin` device `i2c-hid-kbd`) with `patches/u-boot/0002`–`0005`, the
+same device-tree nodes as Linux. The keyboard driver polls and handles attach and detach while the console is
+polled.
+
+## The main UEFI and its secure monitor (`SurfaceRTUEFI.bin`)
+
+A UEFI firmware volume built from NVIDIA's Cardhu code (`NvMainBoardsPkg/OemkS`). The SEC module `OemkSec` is the
+secure monitor. Its SMC entry handles two services; anything else hangs:
+
+- **2, L2 cache** (PL310): r1 selects enable / disable / write-back enable-disable / full-line-of-zeros — the
+  `TZ_L2C310_*` operations Linux already uses.
+- **5, power** (r1 = 1): r2 = 2 per-CPU power-down (L1 clean, leave SMP, SCU power status; CPU0 also syncs and
+  disables the L2; ends in `wfe` until the flow controller power-gates the CPU). r2 = 0 is LP0 (CPU0 only; L2 off,
+  code copied to IRAM, MMU off; sets the warm-boot scratch and EMC self-refresh).
+- **Resume:** the monitor owns the CPU reset vector (EVP), restores its own state, and returns to the normal world
+  at the CPU's parking-protocol mailbox page `+0x800` (SVC, IRQ/FIQ masked); no resume address is passed in a
+  register. The mailboxes are `0x82000000 + (cpu + 1) × 0x1000`: `ProcessorId` at `+0`, `EntryPoint` at `+8`.
+- **Parking loop** (installed into each mailbox page for boot and resume alike): checks `ProcessorId == MPIDR` CPU
+  number and `EntryPoint != 0` before each `wfi`, clears `EntryPoint`, and jumps with `bx`. With `EntryPoint = 0` a
+  resumed CPU parks there for good.
+
+`ResetSystem` uses PMC `MAIN_RST` (never `DEV_OFF_RST`); shutdown clears the PMIC's power sequence and asserts
+`DEV_OFF`. `NvSpiFlashDxe` holds the boot-flash status-register writes (unlock, /WP lock, and a permanent lock that
+would make the 4 MiB read-only for good on a "P" part). The boot device comes from board straps or a fuse override; the update path writes
+per boot device and can burn fuses, and update images are PKCS#7-verified.
 
 ## Windows RT side
 
@@ -99,7 +115,7 @@ From the ACPI tables and the driver package in `data/windows-drivers/`.
   0), cluster switch (r2 = 2; inference from FLOW_CLUSTER_CONTROL), LP0 (r2 = 0, r3 = 0; sets PMC_SCRATCH4
   bit 31). All branch on a "monitor present" byte; without it they run ARM equivalents of the monitor's code,
   which write the resume address into the CPU reset vector themselves. After wake-up, `FLOW_CPUn_CSR` is set to
-  `0xC000`. The monitor itself is in `firststage.md`.
+  `0xC000`. The monitor itself is described above.
 - AML touches the PMIC only in power resources (LDO switching, e.g. LDO5 `0x32` in `PRS1`) and for the RTC
   (`ACPI000E`); DEVCTRL, EN1 and VDDCTRL are left to the driver and the firmware.
 - Secondary CPUs start through the ACPI parking protocol (MADT mailboxes); Linux uses

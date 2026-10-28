@@ -17,7 +17,7 @@ all: $(BINS)
 securet30sec_functions.h: ../securet30sec_loader.py
 	PYTHONPATH=.. python3 -c 'import securet30sec_loader as s; print(s.function_defines(), end="")' > $@
 
-STUB_DEPS = uboot_stub.h ../securet30sec.h ../boottrace.h securet30sec_functions.h
+STUB_DEPS = uboot_stub.h ../securet30sec.h boottrace.h securet30sec_functions.h
 uboot_stub.o: $(STUB_DEPS)
 
 # the stub recording the boot trace (uboot_stub.S)

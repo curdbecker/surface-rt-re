@@ -1,0 +1,38 @@
+From aded447e4188025b9134f4df65c041a9f282a633 Mon Sep 17 00:00:00 2001
+From: Curd Becker <me@curd-becker.de>
+Date: Mon, 26 Oct 2026 16:36:43 +0000
+Subject: [PATCH] Skip USB teardown after the trigger without tty/output mode
+
+On macOS the launcher intermittently hangs on exit after printing
+"Launch complete!". No script code runs at that point, only the
+pyusb/libusb teardown of a device whose stack was just smashed and
+which is now running the payload.
+
+When neither --tty nor -o is given, nothing uses the device after the
+trigger, so exit right away with os._exit() and leave the cleanup to
+the OS.
+---
+ fusee-launcher.py | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/fusee-launcher.py b/fusee-launcher.py
+index 7d3989d..30aa259 100755
+--- a/fusee-launcher.py
++++ b/fusee-launcher.py
+@@ -97,6 +97,13 @@ except IOError:
+     print("The USB device stopped responding-- sure smells like we've smashed its stack. :)")
+     print("Launch complete!")
+ 
++# Without tty/output mode nothing talks to the device after the trigger.
++# Exit without the pyusb/libusb teardown, which can hang on the deliberately
++# broken device (seen on macOS); the payload is already running.
++if not (arguments.tty_mode or arguments.output_file):
++    sys.stdout.flush()
++    os._exit(0)
++
+ if arguments.tty_mode or arguments.output_file:
+     rcm_device.post_trigger()
+ 
+-- 
+2.43.0
+

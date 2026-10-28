@@ -1,13 +1,13 @@
 """
 securet30sec_loader.py - IDA loader for the Surface RT first stage (SecureT30Sec), from the decrypted boot-flash
-bootloader (firmware volume + NVDASPICERTIFICA block, e.g. data/surface-rt/spi-flash/leander-bootloader-decrypted.bin).
+bootloader (firmware volume + NVDASPICERTIFICA block, e.g. data/spi-flash/leander-bootloader-decrypted.bin).
 
 The boot ROM loads the blob to LOAD_BASE and the TE sections run in place (section address = LOAD_BASE + blob
 offset), so the blob is mapped as one image, split into segments by its structure. The loader adds the .reloc
 fixups, the Tegra30 blocks the stage addresses (sparse), the known functions, data and registers below, and the
 types and enums of securet30sec.h (shared with the installer and the payloads; read_header gives its C view,
 LAYOUTS the struct offsets); the reset vector is ARM and IDA follows the switches into Thumb. Findings behind the
-tables: docs/firststage.md. The tables are plain data, importable without IDA. Targets IDA 9.x.
+tables: README.md. The tables are plain data, importable without IDA. Targets IDA 9.x.
 
 OpenSSL (securet30sec_openssl.h/.json, from gen_securet30sec_openssl.py): the header is parsed at load time; after
 auto-analysis identify() names OpenSSL functions and applies the header's prototypes. Run this file as a script to

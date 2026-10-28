@@ -1,25 +1,94 @@
 #!/bin/sh
-# Builds what this repository produces:
+# Builds what this repository needs, after applying its patches to the submodules:
 #   payloads  payloads/*.bin and payloads/securet30sec_functions.h (committed; see payloads/Makefile)
 #   u-boot    U-Boot from the u-boot submodule (surface-rt_defconfig): out/u-boot-dtb-tegra.bin (SPL + U-Boot
-#             proper, which uboot_emmc.py installs and the APX preload also uses), out/u-boot-dtb.bin (U-Boot
-#             proper alone), its symbols out/u-boot.map (securet30 run --uboot-map), its configuration
-#             out/u-boot.config, and out/u-boot-env.txt, the complete environment uboot_emmc.py
-#             installs -- U-Boot's default environment with u-boot-env-overrides.txt applied
-#   diskmode  out/pmos-surface-rt-diskmode.img (diskmode/build-pmos-surface-rt-diskmode.sh; needs root)
+#             proper, which srt_uboot.py installs and the APX preload also uses), out/u-boot-dtb.bin (U-Boot
+#             proper alone), and its symbols out/u-boot.map (securet30 run --uboot-map)
+#   fusee     fusee-tools' Tegra30 payloads (fusee-tools/payloads/out/T30, patch_irom.bin among them)
+#   tegrarcm  fusee-tools/tegrarcm/src/tegrarcm, always on the host (it drives the host's USB)
+#   diskmode  out/pmos-surface-rt-diskmode.img (diskmode/build-pmos-surface-rt-diskmode.sh; root, Linux)
 #   all       all of the above (the default)
 #
-# Every tool needed is in the container of ./Dockerfile:
-#   docker build -t surface-rt-re . && docker run --rm -v "$PWD:/src" surface-rt-re [target...]
-# It also runs natively with those tools installed. Work directories live under $WORK (default: a new temporary
-# directory), outside the checkout; run as root (the container), the results are handed to the checkout's owner.
+# Usage: build.sh [--local] [target...]
+# By default every target but tegrarcm runs in the container of ./Dockerfile (needs docker); --local runs them
+# all on the host, with the tools the Dockerfile lists. Only the diskmode step runs as root (through sudo on the
+# host). Patches are applied only where their files do not hold them yet; files changed otherwise are built as
+# they are. Work directories live under $WORK (default: a new temporary directory), outside the checkout.
 set -eu
 
 SRC=$(cd "$(dirname "$0")" && pwd)
 OUT=${OUT:-$SRC/out}
 WORK=${WORK:-$(mktemp -d)}
 CROSS_COMPILE=${CROSS_COMPILE:-arm-none-eabi-}
-mkdir -p "$OUT"
+IMAGE=surface-rt-re
+P=$SRC/patches
+
+die() {
+	echo "error: $*" >&2
+	exit 1
+}
+
+as_root() {
+	if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi
+}
+
+# Exits unless every command named is on PATH.
+need() {
+	missing=
+	for c in "$@"; do
+		command -v "$c" >/dev/null 2>&1 || missing="$missing $c"
+	done
+	[ -z "$missing" ] || die "missing on the host:$missing"
+}
+
+# apply_patches DIR PATCH...: apply the series to the git tree DIR unless the files it touches already hold
+# its result; if they hold something else, warn and leave them.
+apply_patches() {
+	dir=$1
+	shift
+	idx=$WORK/patch-index
+	rm -f "$idx"
+	GIT_INDEX_FILE=$idx git -C "$dir" read-tree HEAD
+	GIT_INDEX_FILE=$idx git -C "$dir" apply --cached "$@"
+	paths=$(git -C "$dir" apply --numstat "$@" | cut -f3)
+	# shellcheck disable=SC2086 # one path per word
+	if GIT_INDEX_FILE=$idx git -C "$dir" diff --quiet -- $paths; then
+		:
+	elif git -C "$dir" apply --check "$@" 2>/dev/null; then
+		git -C "$dir" apply "$@"
+		echo "applied to ${dir#"$SRC"/}: $(for p in "$@"; do basename "$p"; done | tr '\n' ' ')"
+	else
+		echo "warning: ${dir#"$SRC"/} differs from its patches; building it as it is" >&2
+	fi
+}
+
+patch_target() {
+	case $1 in
+		u-boot) apply_patches "$SRC/u-boot" "$P"/u-boot/0*.patch ;;
+		fusee)
+			apply_patches "$SRC/fusee-tools" "$P/fusee/0001-scripts-use-tegrarcm-instead-of-nvflash.patch"
+			apply_patches "$SRC/fusee-tools/fusee-launcher-new" \
+				"$P/fusee/0001-Skip-USB-teardown-after-the-trigger-without-tty-outp.patch"
+			;;
+		tegrarcm)
+			apply_patches "$SRC/fusee-tools/tegrarcm" \
+				"$P/fusee/0001-main-send-GET_PLATFORM_INFO-before-reading-the-BCT.patch"
+			;;
+	esac
+}
+
+check_target() {
+	case $1 in
+		payloads) need make "${CROSS_COMPILE}gcc" python3 ;;
+		u-boot) need make "${CROSS_COMPILE}gcc" bison flex ;;
+		fusee) need make "${CROSS_COMPILE}gcc" ;;
+		tegrarcm)
+			need make autoreconf pkg-config c++
+			pkg-config --exists libusb-1.0 || die "libusb-1.0 not found by pkg-config (needed by tegrarcm)"
+			;;
+		diskmode) [ "$(id -u)" = 0 ] || need sudo ;;
+	esac
+}
 
 build_payloads() {
 	make -C "$SRC/payloads"
@@ -35,39 +104,71 @@ build_u_boot() {
 	set -- -C "$SRC/u-boot" O="$b" CROSS_COMPILE="$CROSS_COMPILE"
 	make "$@" surface-rt_defconfig
 	make "$@" -j"$(getconf _NPROCESSORS_ONLN)"
-	make "$@" u-boot-initial-env
 	cp "$b/u-boot-dtb-tegra.bin" "$b/u-boot-dtb.bin" "$OUT/"
-	cp "$b/.config" "$OUT/u-boot.config"
 	cp "$b/System.map" "$OUT/u-boot.map"
-	{
-		echo "# U-Boot's default environment ($(git -C "$SRC/u-boot" describe --always --dirty), surface-rt_defconfig)"
-		echo "# with u-boot-env-overrides.txt applied. Generated by build.sh u-boot; do not edit."
-		# overrides replace the default's variable of the same name in place; new ones are appended
-		awk 'NR == FNR {
-			if ($0 !~ /^#/ && index($0, "=")) { k = substr($0, 1, index($0, "=") - 1); ov[k] = $0; keys[++n] = k }
-			next
-		}
-		{ k = substr($0, 1, index($0, "=") - 1); if (k in ov) { print ov[k]; done[k] = 1 } else print }
-		END { for (i = 1; i <= n; i++) if (!(keys[i] in done)) print ov[keys[i]] }' \
-			"$SRC/u-boot-env-overrides.txt" "$b/u-boot-initial-env"
-	} > "$OUT/u-boot-env.txt"
+}
+
+build_fusee() {
+	make -C "$SRC/fusee-tools/payloads" -j1 ARCH=arm CROSS_COMPILE="$CROSS_COMPILE" T30
+}
+
+build_tegrarcm() {
+	t=$SRC/fusee-tools/tegrarcm
+	[ -f "$t/Makefile" ] || (cd "$t" && ./autogen.sh)
+	make -C "$t"
 }
 
 build_diskmode() {
-	WORK=$WORK/pmos sh "$SRC/diskmode/build-pmos-surface-rt-diskmode.sh" "$OUT/pmos-surface-rt-diskmode.img"
+	img=$OUT/pmos-surface-rt-diskmode.img
+	as_root env WORK="$WORK/pmos" sh "$SRC/diskmode/build-pmos-surface-rt-diskmode.sh" "$img"
+	[ "$(id -u)" = 0 ] || sudo chown "$(id -u):$(id -g)" "$img"
 }
 
+local=
+if [ "${1:-}" = --local ]; then
+	local=1
+	shift
+fi
 [ $# -gt 0 ] || set -- all
+targets=
 for t in "$@"; do
 	case $t in
-		payloads) build_payloads ;;
-		u-boot) build_u_boot ;;
-		diskmode) build_diskmode ;;
-		all) build_payloads; build_u_boot; build_diskmode ;;
-		*) echo "error: unknown target '$t' (payloads, u-boot, diskmode, all)" >&2; exit 1 ;;
+		payloads | u-boot | fusee | tegrarcm | diskmode) targets="$targets $t" ;;
+		all) targets="$targets payloads u-boot fusee tegrarcm diskmode" ;;
+		*) die "unknown target '$t' (payloads, u-boot, fusee, tegrarcm, diskmode, all)" ;;
 	esac
 done
 
+# The host part: tegrarcm always, everything with --local; the rest goes to the container.
+host= container=
+for t in $targets; do
+	if [ -n "$local" ] || [ "$t" = tegrarcm ]; then host="$host $t"; else container="$container $t"; fi
+done
+[ -z "$container" ] || command -v docker >/dev/null 2>&1 || die "docker not found; install it, or build on the host with --local"
+need git
+for t in $host; do check_target "$t"; done
+mkdir -p "$OUT"
+# Patches are applied on the host, so the container does not leave root-owned files in the submodules.
+if [ -z "${PATCHES_APPLIED:-}" ]; then
+	for t in $targets; do patch_target "$t"; done
+fi
+
+if [ -n "$container" ]; then
+	# no build context: the image copies nothing, the checkout is mounted
+	docker build -q -t "$IMAGE" - <"$SRC/Dockerfile" >/dev/null
+	# shellcheck disable=SC2086 # one target per word
+	docker run --rm -v "$SRC:/src" -v "$OUT:/out" -e OUT=/out -e PATCHES_APPLIED=1 "$IMAGE" $container
+fi
+for t in $host; do
+	case $t in
+		u-boot) build_u_boot ;;
+		*) "build_$t" ;;
+	esac
+done
+
+# Run as root (the container): hand the results to the checkout's owner.
 if [ "$(id -u)" = 0 ]; then
-	chown -R "$(stat -c %u:%g "$SRC")" "$OUT" "$SRC/payloads"
+	for d in "$OUT" "$SRC/payloads" "$SRC/fusee-tools/payloads/out"; do
+		[ ! -e "$d" ] || chown -R "$(stat -c %u:%g "$SRC")" "$d"
+	done
 fi

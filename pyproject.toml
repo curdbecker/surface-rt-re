@@ -17,6 +17,11 @@ tools = [
     "pcpp",
     "uefi-firmware",
 ]
+# srt_uboot.py bootstrap drives fusee-launcher, which needs pyusb (and a system libusb); host-only, so opt-in:
+# uv sync --group bootstrap.
+bootstrap = [
+    "pyusb",
+]
 
 [tool.uv]
 default-groups = []

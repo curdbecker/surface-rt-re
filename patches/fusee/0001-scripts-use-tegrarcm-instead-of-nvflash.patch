@@ -1,0 +1,31 @@
+Top-level scripts: use tegrarcm instead of the nvflash ELF32 binaries.
+
+get_bct.sh and run_bootloader.sh called the prebuilt x86 nvflash in utils/ (ELF32 Linux binaries); switch both to
+the tegrarcm built from the submodule (readbct for the BCT dump; --bootloader/--miniloader with the patched
+Tegra30 v1.13 miniloader for launching U-Boot). The commented-out nvflash lines are kept as a reference.
+
+Apply inside the fusee-tools submodule:  git -C fusee-tools apply ../patches/fusee/0001-scripts-use-tegrarcm-instead-of-nvflash.patch
+
+diff --git a/get_bct.sh b/get_bct.sh
+index c9a42c4..ff6d5ce 100755
+--- a/get_bct.sh
++++ b/get_bct.sh
+@@ -37,4 +37,5 @@ fi
+ 
+ sleep 1
+ 
+-./utils/"$nvflash" --getbct --bct "$bct" --configfile ./utils/flash.cfg
++./tegrarcm/src/tegrarcm --usb-timeout=0 --bct current.bct readbct
++#./utils/"$nvflash" --getbct --bct "$bct" --configfile ./utils/flash.cfg
+diff --git a/run_bootloader.sh b/run_bootloader.sh
+index 547e44d..ac160c1 100755
+--- a/run_bootloader.sh
++++ b/run_bootloader.sh
+@@ -44,4 +44,6 @@ fi
+ 
+ sleep 1
+ 
+-./utils/"$nvflash" --setbct --bct "$bct" --configfile ./utils/flash.cfg --bl "$bootloader" --go
++#./utils/"$nvflash" --setbct --bct "$bct" --configfile ./utils/flash.cfg --bl "$bootloader" --go
++./tegrarcm/src/tegrarcm --usb-timeout=0 --bct "$bct" --bootloader "$bootloader" \
++  --miniloader ./miniloaders/miniloader_t30_v1_13_patched.bin

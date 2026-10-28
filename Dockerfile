@@ -1,12 +1,9 @@
-# Build environment for this repository: every tool build.sh needs (payloads, U-Boot, the disk-mode image). The
-# sources are not copied into the image; the checkout is mounted:
-#   git clone --recurse-submodules <repository> && cd surface-rt-re
-#   docker build -t surface-rt-re .
-#   docker run --rm -v "$PWD:/src" surface-rt-re [payloads | u-boot | diskmode | all]
-# Results land in out/ (payloads in payloads/), owned like the checkout. The disk-mode build needs root and the
-# CAP_SYS_CHROOT / CAP_MKNOD capabilities, which a default docker run grants (no --privileged), and network at
-# run time (signature-checked pmOS/Alpine packages). Its work directories stay inside the container, since a
-# bind mount (Docker Desktop on macOS in particular) supports neither chroot nor device nodes.
+# Build environment for build.sh's container targets (payloads, u-boot, fusee, diskmode), built and run by
+# build.sh: the image copies nothing, the checkout is mounted at /src and the results directory at /out. The
+# disk-mode build needs root and the CAP_SYS_CHROOT / CAP_MKNOD capabilities, which a default docker run grants
+# (no --privileged), and network at run time (signature-checked pmOS/Alpine packages). Its work directories stay
+# inside the container, since a bind mount (Docker Desktop on macOS in particular) supports neither chroot nor
+# device nodes.
 FROM debian:bookworm-slim
 
 RUN apt-get update \
@@ -18,5 +15,4 @@ RUN apt-get update \
     && git config --system --add safe.directory '*'
 
 WORKDIR /src
-ENTRYPOINT ["sh", "/src/build.sh"]
-CMD ["all"]
+ENTRYPOINT ["sh", "/src/build.sh", "--local"]
