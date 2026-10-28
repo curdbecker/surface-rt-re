@@ -435,7 +435,7 @@ def cmd_bootstrap(args):
         load_factory_backup(args.backup)
     uboot = os.path.abspath(os.path.join(args.images, UBOOT_BIN))
     diskimg = os.path.join(args.images, DISKMODE_IMG)
-    bct = os.path.abspath(args.bct or os.path.join(FUSEE, 'current.bct'))
+    bct = os.path.abspath(args.bct)
     # fusee-tools' pieces (run_bootloader.sh stays for manual use; here we drive them ourselves so they run in
     # this interpreter's environment -- fusee-launcher needs pyusb, which the project provides).
     launcher = os.path.join(FUSEE, 'fusee-launcher-new', 'fusee-launcher.py')
@@ -555,7 +555,7 @@ def main(argv=None):
                          'pyusb (uv sync --group bootstrap). Start it '
                          'with sudo: the USB tools run as the invoking user, only the LUN detection and the eMMC '
                          'write as root.')
-    pbs.add_argument('--bct', help='Surface RT BCT for the APX RAM-load (default: fusee-tools/current.bct)')
+    pbs.add_argument('--bct', help='Surface RT BCT for the APX RAM-load', default='fusee-tools/bct/surface-rt.bct')
     pbs.add_argument('--uninstall', action='store_true',
                      help='restore the factory state from --backup FILE instead of installing (UEFI boots again)')
     pbs.add_argument('--no-install', action='store_true',
