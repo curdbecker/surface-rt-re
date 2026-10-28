@@ -24,8 +24,8 @@ from, as published there.
 Top Specification*, SWCS049S (June 2010, revised August 2018), © Texas Instruments.
 Source: <https://www.ti.com/lit/ds/symlink/tps65911.pdf>
 
-`tps65911-regs-firmware.txt` and `tps65911-regs-linux.txt`: our own register dumps of this board's PMIC
-(firmware hand-over and running Linux); how each was taken is in its header.
+`tps65911-regs-*.txt`: our own register dumps of this board's PMIC (`uefi`: the UEFI's hand-over; `linux-uefi`,
+`linux-uboot`: running Linux, booted through the UEFI or U-Boot); how each was taken is in its header.
 
 ## `spi-flash/` — boot flash (W25Q32) data sheet and published dumps
 

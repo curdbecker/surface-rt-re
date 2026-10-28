@@ -17,27 +17,52 @@ Linux powers off with TPS65911 `DEV_OFF` and restarts with `DEV_OFF_RST` (DEVCTR
 `drivers/mfd/tps65910.c`); PMC `MAIN_RST` is the low-priority restart fallback. Both PMIC commands work, from
 userspace and late in shutdown.
 
-### PMIC state: firmware hand-over vs. running Linux
+### Suspend and CPU hotplug
 
-Full dumps: `data/pmic/tps65911-regs-firmware.txt` (start of the TPS65911 probe, after a long-press power-off) and
-`tps65911-regs-linux.txt` (`i2cdump` under Linux). All differences (RTC left out) and the power-relevant registers
-that agree:
+Suspend-to-RAM uses LP2 (`nvidia,suspend-mode = <2>`: CPU rail off through EN1, core powered) and works, waking
+on the power button and the Tegra RTC (`rtcwake -d rtc1`); CPU offline and online work too. Both need the kCFI patch in
+`patches/linux-libre-tegra/` with the pmaports kernel (`CONFIG_CFI=y`): `tegra_cpu_die()` reaches `tegra30_hotplug_shutdown()` through a function pointer, and the
+assembly routine had no kCFI type hash, so the check trapped on the dying CPU after its cache was off. That CPU
+was never power-gated and the CPU running the teardown waited in `tegra30_wait_cpu_in_reset()` forever. Suspend
+takes CPUs 1–3 offline first, so it hung the same way. The patch also covers `tegra{20,30}_sleep_core_finish`
+(LP1, not used on this board); cpuidle's C7 and CC6 call the shutdown code directly or from assembly and were not
+affected.
 
-| Reg | Firmware | Linux | Meaning |
-|---|---|---|---|
-| `0x28` VDDCTRL_OP | `0x27` | `0x23` | 1.05 V / 1.0 V (CPU voltage scaling) |
-| `0x29` VDDCTRL_SR | `0x00` | `0x00` | `vdd_cpu` off while EN1 is low |
-| `0x35` LDO6 | `0x11` | `0x10` | Linux switches LDO6 off |
-| `0x3F` DEVCTRL | `0x96` | `0x96` | `PWR_OFF_SEQ`, `SR_CTL_I2C_SEL`, `DEV_ON`, `DEV_SLP` |
-| `0x40` DEVCTRL2 | `0x76` | `0x76` | `DCDC_SLEEP_LVL`, SLEEP input active-low, `PWON_LP_OFF`, `PWON_LP_RST` |
-| `0x41` SLEEP_KEEP_LDO_ON | `0xde` | `0x00` | firmware's sleep configuration, cleared by the regulator driver's probe |
-| `0x42` SLEEP_KEEP_RES_ON | `0xc7` | `0xc0` | ditto (VIO/VDD1/VDD2 keep-on) |
-| `0x43` SLEEP_SET_LDO_OFF | `0x21` | `0x00` | ditto |
-| `0x44` SLEEP_SET_RES_OFF | `0x08` | `0x00` | ditto (`VDDCTRL_SETOFF`) |
-| `0x46` EN1_SMPS_ASS | `0x08` | `0x08` | `vdd_cpu` under EN1 control, set by the firmware |
-| `0x51` INT_MSK | `0xff` | `0xbf` | one PMIC interrupt unmasked by Linux |
+### PMIC state: UEFI hand-over and running Linux, per boot path
 
-PMIC GPIO2 (`0x62` = `0x87`: forced low in SLEEP, set high, reads high) shows the PMIC is ACTIVE while Linux runs.
+Dumps in `data/pmic/`: `tps65911-regs-uefi.txt` (the UEFI's hand-over, read at the start of the TPS65911 probe after
+a long-press power-off), `tps65911-regs-linux-uefi.txt` and `tps65911-regs-linux-uboot.txt` (`i2cdump` under Linux,
+booted through the UEFI or U-Boot). U-Boot writes only `0x27` VDDCTRL and `0x28` VDDCTRL_OP (SPL); the Linux device
+tree describes neither VDD1 nor VDD2, so those keep what the boot left. All differences (RTC left out) and the
+power-relevant registers that agree:
+
+| Reg | UEFI | Linux (UEFI) | Linux (U-Boot) | Meaning |
+|---|---|---|---|---|
+| `0x20` VIO | `0x85` | `0x85` | `0x05` | 1.8 V, on; current limit 1700 mA after the UEFI, 650 mA (reset value) after U-Boot |
+| `0x21` VDD1 | `0x8d` | `0x8d` | `0x0c` | on with `VGAIN_SEL` = 10 after the UEFI; off after U-Boot |
+| `0x22` VDD1_OP | `0x37` | `0x37` | `0x03` | SEL 1.25 V after the UEFI |
+| `0x23` VDD1_SR | `0x00` | `0x00` | `0x03` | |
+| `0x24` VDD2 | `0x8d` | `0x8d` | `0x0d` | on; `VGAIN_SEL` = 10 after the UEFI, 00 after U-Boot |
+| `0x25` VDD2_OP | `0x45` | `0x45` | `0x4b` | SEL 1.425 V after the UEFI, 1.5 V after U-Boot |
+| `0x28` VDDCTRL_OP | `0x27` | `0x23` | `0x1b` | 1.05 V / 1.0 V / 0.9 V (CPU voltage scaling) |
+| `0x29` VDDCTRL_SR | `0x00` | `0x00` | `0x00` | `vdd_cpu` off while EN1 is low |
+| `0x35` LDO6 | `0x11` | `0x10` | `0x10` | Linux switches LDO6 off |
+| `0x3F` DEVCTRL | `0x96` | `0x96` | `0x92` | `PWR_OFF_SEQ`, `SR_CTL_I2C_SEL`, `DEV_SLP`; `DEV_ON` only after the UEFI |
+| `0x40` DEVCTRL2 | `0x76` | `0x76` | `0x36` | SLEEP input active-low, `PWON_LP_OFF`, `PWON_LP_RST`, INT1 active-low; `DCDC_SLEEP_LVL` only after the UEFI |
+| `0x41` SLEEP_KEEP_LDO_ON | `0xde` | `0x00` | `0x00` | the UEFI's sleep configuration, cleared by the regulator driver's probe |
+| `0x42` SLEEP_KEEP_RES_ON | `0xc7` | `0xc0` | `0x40` | VIO/VDD1/VDD2 keep-on cleared by the regulator driver; `CLKOUT32K_KEEPON` from `ti,sleep-keep-ck32k`; `THERM_KEEPON` only after the UEFI |
+| `0x43` SLEEP_SET_LDO_OFF | `0x21` | `0x00` | `0x00` | the UEFI's sleep configuration, cleared by the regulator driver's probe |
+| `0x44` SLEEP_SET_RES_OFF | `0x08` | `0x00` | `0x00` | ditto (`VDDCTRL_SETOFF`) |
+| `0x46` EN1_SMPS_ASS | `0x08` | `0x08` | `0x08` | `vdd_cpu` under EN1 control, set by the UEFI and by the regulator driver (`ti,regulator-ext-sleep-control = <1>`) |
+| `0x50` INT_STS | `0x00` | `0x00` | `0x1d` | after U-Boot, latched PWRHOLD, PWRON long-press, PWRON and VMBDCH events, all masked |
+| `0x51` INT_MSK | `0xff` | `0xbf` | `0xbf` | Linux unmasks the RTC alarm |
+| `0x62` GPIO2 | `0x87` | `0x87` | `0x87` | output high, `GPIO_SLEEP` (forced low in SLEEP) |
+| `0x68` GPIO8 | `0x07` | `0x07` | `0x0f` | output high; pulldown enabled after U-Boot |
+
+SEL voltages are computed from the data sheet (12.5 mV steps from 0.6 V at SEL 3), not measured. The data sheet
+gives `VGAIN_SEL` = 10 as gain ×2, which would put VDD2 at 2.85 V after the UEFI; the Asus TF600T device tree (same
+PMIC) has VDD2 as the 1.2 V DDR I/O rail (`vddio_ddr`), so the effective VDD1/VDD2 voltages are unsettled. `GPIO_SLEEP` takes effect only when GPIO2 is assigned to a power-up time slot (data sheet,
+GPIO0_REG note); whether it is on this board is unknown.
 
 ## Type Cover
 
@@ -72,7 +97,7 @@ The keyboard report has no reserved byte after the modifiers and 10 key slots, s
 layout. The descriptor has no LED output report. The other HID-over-I2C devices on the board are the Atmel
 touchscreen (`03EB:8207`, I2C2 `0x5b`) and the sensor hub (`045E:0798`).
 
-U-Boot takes the cover as console input (`stdin` device `i2c-hid-kbd`) with `patches/u-boot/0002`–`0005`, the
+U-Boot takes the cover as console input (`stdin` device `i2c-hid-kbd`) with the Type Cover patches in `patches/u-boot/`, the
 same device-tree nodes as Linux. The keyboard driver polls and handles attach and detach while the console is
 polled.
 

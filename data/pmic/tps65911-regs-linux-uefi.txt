@@ -1,5 +1,5 @@
-# TPS65911 (I2C5 0x2d) registers under running Linux: i2cdump -f -y <bus> 0x2d (byte access).
-# Kernel: libre-tegra 7.0.1 @ bfffc6d6656e + kernel/0001-0003, unmodified tps65910 drivers. Surface RT, 2026-10-24.
+# TPS65911 (I2C5 0x2d) registers under running Linux, booted through the UEFI: i2cdump -f -y <bus> 0x2d (byte access).
+# Kernel: libre-tegra 7.0.1 @ bfffc6d6656e. Surface RT, 2026-10-24.
 # 0x00-0x02 are the RTC (seconds, minutes, hours).
      0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f
 00: 41 56 21 24 10 26 04 00 49 14 21 16 10 26 00 00
